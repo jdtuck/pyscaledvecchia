@@ -71,6 +71,28 @@ def _block_cov(Xb, ranges, variance, nugget, nu, derivs=True, nug_mask=None):
     """
     B, K, d = Xb.shape
     U = Xb / ranges                                   # scaled inputs
+
+    if not derivs:
+        # No derivatives needed (used throughout prediction): get pairwise
+        # distances from the Gram matrix instead of materialising the full
+        # (B,K,K,d) difference tensor. Mathematically identical to the
+        # diff-based path below but avoids an O(B K K d) array, which is a
+        # large win whenever K or d is not tiny (e.g. prediction with large
+        # m_pred).
+        sq = np.einsum("bkl,bkl->bk", U, U)
+        gram = np.einsum("bik,bjk->bij", U, U)
+        r2 = sq[:, :, None] + sq[:, None, :] - 2.0 * gram
+        np.maximum(r2, 0.0, out=r2)                   # guard tiny negatives
+        r = np.sqrt(r2)
+        M = _matern_corr(r, nu)
+        eye = np.eye(K)
+        if nug_mask is None:
+            nug_diag = eye[None, :, :] * nugget
+        else:
+            nug_diag = eye[None, :, :] * (nugget * nug_mask[:, :, None])
+        Sigma = variance * (M + nug_diag)
+        return Sigma, None
+
     diff = U[:, :, None, :] - U[:, None, :, :]        # (B,K,K,d)
     r = np.sqrt(np.einsum("bijl,bijl->bij", diff, diff))
 
@@ -81,9 +103,6 @@ def _block_cov(Xb, ranges, variance, nugget, nu, derivs=True, nug_mask=None):
     else:
         nug_diag = eye[None, :, :] * (nugget * nug_mask[:, :, None])
     Sigma = variance * (M + nug_diag)
-
-    if not derivs:
-        return Sigma, None
 
     P = d + 2
     dS = np.empty((B, P, K, K))
