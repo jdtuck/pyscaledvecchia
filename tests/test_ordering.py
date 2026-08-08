@@ -53,5 +53,14 @@ def test_find_ordered_nn_start_param_skips_rows():
     m = 6
     nn_full = find_ordered_nn(X, m, start=0)
     nn_partial = find_ordered_nn(X, m, start=40)
-    # rows >= start should agree regardless of start
-    np.testing.assert_array_equal(nn_full[40:], nn_partial[40:])
+    # Rows >= start should agree regardless of `start`, up to the order
+    # within the conditioning set: find_ordered_nn only guarantees the *set*
+    # of the m nearest neighbours for i > m, not a stable order among them
+    # (see its docstring). `start` changes how candidates are batched
+    # against the KD-tree, so ties/near-ties can legitimately land in a
+    # different order via np.argpartition without changing which neighbours
+    # are selected.
+    assert np.array_equal(nn_full[40:, 0], nn_partial[40:, 0])
+    for i in range(40, 60):
+        assert set(nn_full[i, 1:].tolist()) == set(nn_partial[i, 1:].tolist()), \
+            f"neighbour set mismatch at row {i}"
