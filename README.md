@@ -43,7 +43,8 @@ q_ij        = sqrt( sum_l ((x_il - x_jl) / lambda_l)^2 )
 All parameters (`sigma^2`, `lambda_1..d`, `tau`) are optimized on the log
 scale so positivity is automatic.
 
-Pure NumPy/SciPy — no compiled extensions required.
+Pure NumPy/SciPy/Numba — no compiled extension to build (Numba JIT-compiles
+the hot loops at runtime and caches them to disk).
 
 ## Installation
 
@@ -57,7 +58,7 @@ or, to also pull in the test dependencies:
 pip install -e ".[test]"
 ```
 
-Requires Python >= 3.9, NumPy >= 1.22, SciPy >= 1.8.
+Requires Python >= 3.9, NumPy >= 1.22, SciPy >= 1.8, Numba >= 0.58.
 
 ## Quick start
 
@@ -114,6 +115,32 @@ See the docstring on `ScaledVecchiaGP` for the full list.
 Lower-level building blocks are also exported for anyone who wants to
 compose their own estimator: `maximin_order`, `find_ordered_nn`,
 `vecchia_profile_loglik`.
+
+## Performance
+
+The two hottest code paths -- the per-block covariance/derivative evaluation
+in `_covariance.py` and the maximin ordering in `ordering.py` -- are
+implemented with [Numba](https://numba.pydata.org/) (`@njit`) rather than
+plain NumPy, since both are dominated by small nested loops that a
+vectorised NumPy implementation can't fuse without materialising several
+intermediate arrays per block. Measured on the 4000-point/8-D borehole demo
+below, this cuts total fit time roughly **3x** compared to an
+equivalent pure-NumPy implementation (batched Cholesky/`solve` calls, which
+already go through LAPACK, are left as NumPy/SciPy since compiling them
+again buys nothing).
+
+Practical notes:
+
+- The first call to a given `@njit` function in a process triggers a JIT
+  compile (roughly a few seconds total across all the kernels the package
+  uses). `cache=True` persists the compiled code to disk, so this cost is
+  paid once per machine/Numba version, not once per run.
+- Numba's supported NumPy version range sometimes trails the newest NumPy
+  release; if `pip install` reports a resolution conflict, pin NumPy to a
+  slightly older minor version or check the
+  [Numba compatibility table](https://numba.readthedocs.io/en/stable/user/installing.html).
+- `maximin_order` is still the exact `O(n^2 d)` algorithm (just a much
+  faster constant factor now); see "Notes / limitations" below.
 
 ## Package layout
 
