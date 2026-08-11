@@ -46,7 +46,17 @@ class ScaledVecchiaGP:
     m_est   : conditioning-set size for likelihood evaluation (paper default 30)
     m_pred  : conditioning-set size for prediction            (paper default 140)
     n_est   : subsample size used for parameter estimation    (paper default 5000)
-    nu      : Matern smoothness, one of 0.5 / 1.5 / 2.5
+    nu      : Matern smoothness. A fixed positive float (0.5, 1.5, 2.5 use fast
+              Numba-compiled closed forms; any other value falls back to the
+              general Bessel-based Matern, which is slower per block), or
+              `None` to *estimate* nu jointly with the other covariance
+              parameters via Fisher scoring (Sec. 3.5 of the paper). The
+              paper's own reference implementation does exactly this when nu
+              is left unspecified, starting from an initial smoothness of
+              3.5; estimating nu always uses the (non-Numba) Bessel-based
+              covariance, since the derivative of a Bessel function with
+              respect to its order has no closed form and the half-integer
+              fast paths only exist at fixed nu.
     trend   : 'constant' (psi(x) = 1), 'linear' (psi(x) = (1, x')'), or 'zero'
     nugget  : None -> estimate the relative nugget; a float -> hold it fixed
               (use e.g. 1e-8 for a deterministic computer model)
@@ -59,7 +69,7 @@ class ScaledVecchiaGP:
     m_est: int = 30
     m_pred: int = 140
     n_est: int = 5000
-    nu: float = 2.5
+    nu: float | None = 2.5
     trend: str = "constant"
     nugget: float | None = None
     var_penalty: float = 1.0
@@ -76,6 +86,9 @@ class ScaledVecchiaGP:
     theta_: np.ndarray = field(default=None, init=False, repr=False)
     beta_: np.ndarray = field(default=None, init=False, repr=False)
     b_: float = field(default=1.0, init=False)
+    d_: int = field(default=None, init=False, repr=False)
+    _estimate_nu: bool = field(default=False, init=False, repr=False)
+    _nu_fit: float = field(default=None, init=False, repr=False)
 
     # ---------------- basis / scaling helpers ------------------------------
     def _design(self, X):
@@ -93,7 +106,7 @@ class ScaledVecchiaGP:
 
     @property
     def ranges_(self):
-        return np.exp(self.theta_[1:-1])
+        return np.exp(self.theta_[1:1 + self.d_])
 
     @property
     def relevance_(self):
@@ -101,13 +114,23 @@ class ScaledVecchiaGP:
         return 1.0 / self.ranges_
 
     @property
+    def nu_(self):
+        """Matern smoothness actually used: the fixed `nu`, or the fitted
+        value if `nu=None` requested estimation."""
+        return self._nu_fit
+
+    @property
     def nugget_(self):
         return math.exp(self.theta_[-1])
 
-    def _clip_ranges(self, theta):
-        d = len(theta) - 2
+    def _clip_theta(self, theta, d, estimate_nu):
         hi = math.log(self.lambda_max) if np.isfinite(self.lambda_max) else np.inf
         theta[1:1 + d] = np.clip(theta[1:1 + d], math.log(1e-8), hi)
+        if estimate_nu:
+            # Keep the Bessel evaluations well-conditioned and the smoothness
+            # in a practically identifiable range (very large nu is close to
+            # indistinguishable from a squared-exponential kernel).
+            theta[1 + d] = np.clip(theta[1 + d], math.log(0.3), math.log(10.0))
         theta[-1] = np.clip(theta[-1], math.log(1e-12), math.log(1e3))
         return theta
 
@@ -118,6 +141,10 @@ class ScaledVecchiaGP:
         n, d = X.shape
         if y.shape[0] != n:
             raise ValueError("X and y have incompatible shapes")
+
+        estimate_nu = self.nu is None
+        self._estimate_nu = estimate_nu
+        self.d_ = d
 
         # Standardise the input box to [0,1]^d so that 1/lambda_l is comparable
         # across dimensions, and centre/scale y for numerical conditioning.
@@ -139,12 +166,15 @@ class ScaledVecchiaGP:
         m = min(self.m_est, len(sub) - 1)
 
         # ---- initial values -----------------------------------------------
-        theta = np.empty(d + 2)
+        P0 = d + 2 + (1 if estimate_nu else 0)
+        theta = np.empty(P0)
         theta[0] = math.log(max(ye.var(), 1e-8))
         theta[1:1 + d] = math.log(0.2 * math.sqrt(d))     # ranges in the unit box
         fixed_nug = self.nugget is not None
+        if estimate_nu:
+            theta[1 + d] = math.log(1.5)                  # initial smoothness guess
         theta[-1] = math.log(self.nugget if fixed_nug else 0.1)
-        theta = self._clip_ranges(theta)
+        theta = self._clip_theta(theta, d, estimate_nu)
 
         # ---- mutable Vecchia structure (refreshed by the reorder hook) -----
         state = {}
@@ -164,12 +194,12 @@ class ScaledVecchiaGP:
         last_ranges = np.exp(theta[1:1 + d]).copy()
 
         def objective(th):
-            th = self._clip_ranges(np.array(th, dtype=float))
+            th = self._clip_theta(np.array(th, dtype=float), d, estimate_nu)
             if fixed_nug:
                 th[-1] = math.log(self.nugget)
             ll, g, M, beta = vecchia_profile_loglik(
                 th, state["Xo"], state["yo"], state["Zo"], state["groups"],
-                self.nu, need_grad=True,
+                self.nu, estimate_nu=estimate_nu, need_grad=True,
                 var_penalty=self.var_penalty,
                 log_var_target=math.log(max(ye.var(), 1e-8)),
             )
@@ -180,7 +210,7 @@ class ScaledVecchiaGP:
 
         def reorder_hook(th, k):
             nonlocal last_ranges
-            r = np.exp(self._clip_ranges(np.array(th))[1:1 + d])
+            r = np.exp(self._clip_theta(np.array(th), d, estimate_nu)[1:1 + d])
             if np.max(np.abs(np.log(r / last_ranges))) < 1e-3:
                 return False
             if self.verbose:
@@ -194,12 +224,13 @@ class ScaledVecchiaGP:
             theta, objective, max_iter=self.max_iter, tol=self.tol,
             verbose=self.verbose, reorder_hook=reorder_hook)
 
-        theta = self._clip_ranges(np.array(theta))
+        theta = self._clip_theta(np.array(theta), d, estimate_nu)
         if fixed_nug:
             theta[-1] = math.log(self.nugget)
         self.theta_ = theta
         self.beta_ = beta
         self.loglik_ = ll
+        self._nu_fit = math.exp(theta[1 + d]) if estimate_nu else self.nu
 
         # ---- variance correction (Sec. 3.4) --------------------------------
         self.b_ = 1.0
@@ -232,7 +263,7 @@ class ScaledVecchiaGP:
             mask = np.ones((a1 - a0, K), dtype=float)
             if noise_free:
                 mask[:, K - 1] = 0.0          # predict the latent surface
-            Sig, _ = _block_cov(Xb, ranges, var, nug, self.nu,
+            Sig, _ = _block_cov(Xb, ranges, var, nug, self.nu_,
                                  derivs=False, nug_mask=mask)
             L = _batch_chol(Sig)
             E = np.zeros((a1 - a0, K, 1))
@@ -306,7 +337,7 @@ class ScaledVecchiaGP:
             mask[:, K - 1] = 0.0                              # noise-free target
             # neighbours that are prediction points are also noise-free
             mask[:, :K - 1] = (block[:, :K - 1] < n).astype(float)
-            Sig, _ = _block_cov(Xo[block], ranges, var, nug, self.nu,
+            Sig, _ = _block_cov(Xo[block], ranges, var, nug, self.nu_,
                                  derivs=False, nug_mask=mask)
             L = _batch_chol(Sig)
             E = np.zeros((a1 - a0, K, 1))
@@ -399,10 +430,12 @@ class ScaledVecchiaGP:
 
     def summary(self):
         self._check_fitted()
-        s = [f"ScaledVecchiaGP(nu={self.nu}, m_est={self.m_est}, "
-             f"m_pred={self.m_pred}, trend='{self.trend}')",
+        nu_label = "estimated" if self._estimate_nu else "fixed"
+        s = [f"ScaledVecchiaGP(nu={'estimate' if self.nu is None else self.nu}, "
+             f"m_est={self.m_est}, m_pred={self.m_pred}, trend='{self.trend}')",
              f"  Vecchia loglik (standardised y) : {self.loglik_:.3f}",
              f"  sigma^2 : {self.variance_:.6g}",
+             f"  nu      : {self.nu_:.4g}  ({nu_label})",
              f"  nugget  : {self.nugget_:.6g}  (relative)",
              f"  b       : {self.b_:.4g}  (variance correction)",
              "  input relevances 1/lambda_l (unit-box scaling):"]

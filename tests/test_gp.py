@@ -125,3 +125,66 @@ def test_invalid_trend_raises():
     gp = ScaledVecchiaGP(trend="bogus")
     with pytest.raises(ValueError):
         gp.fit(np.random.rand(20, 2), np.random.rand(20))
+
+
+# ---------------------------------------------------------------------------
+# Matern smoothness (nu): fixed general value, and estimation
+# ---------------------------------------------------------------------------
+
+def test_fixed_noninteger_nu_fits_without_error():
+    """nu fixed at a value with no closed form should transparently use the
+    general Bessel-based covariance path."""
+    X, y = _sine_data(150, seed=20)
+    gp = ScaledVecchiaGP(m_est=10, m_pred=20, n_est=150, nu=1.75,
+                          random_state=0).fit(X, y)
+    assert gp.nu_ == pytest.approx(1.75)
+    mu = gp.predict(X[:5])
+    assert mu.shape == (5,) and np.all(np.isfinite(mu))
+
+
+def test_estimate_nu_recovers_reasonable_value_on_simulated_matern_data():
+    """Simulate data from a *known* general-nu Matern GP and check the
+    estimated nu lands in a sane neighbourhood of the truth. nu is a
+    famously hard parameter to pin down exactly with finite data (see e.g.
+    Zhang 2004 on infill asymptotics), so this only checks a wide, sane
+    range rather than tight recovery."""
+    from scipy.spatial.distance import cdist
+
+    from scaled_vecchia._matern_general import _matern_corr_general
+
+    rng = np.random.default_rng(0)
+    n, d = 500, 2
+    X = rng.random((n, d))
+    true_nu, true_range, true_var, true_nug = 1.75, np.array([0.25, 0.4]), 1.5, 0.02
+
+    r = cdist(X / true_range, X / true_range)
+    K = true_var * (_matern_corr_general(r, true_nu) + true_nug * np.eye(n))
+    L = np.linalg.cholesky(K + 1e-10 * np.eye(n))
+    y = L @ rng.standard_normal(n)
+
+    gp = ScaledVecchiaGP(m_est=25, m_pred=50, nu=None, n_est=500, trend="zero",
+                          var_correction=False, random_state=0).fit(X, y)
+
+    assert gp._estimate_nu is True
+    assert 0.5 < gp.nu_ < 5.0          # sane neighbourhood of the true 1.75
+    assert gp.nugget_ == pytest.approx(true_nug, rel=0.5)
+    # the smaller true range (x0) should be recovered as more relevant
+    assert gp.relevance_[0] > gp.relevance_[1]
+
+
+def test_estimate_nu_predict_runs_and_is_finite():
+    X, y = _sine_data(200, seed=21)
+    gp = ScaledVecchiaGP(m_est=15, m_pred=30, n_est=200, nu=None,
+                          random_state=0).fit(X, y)
+    Xte = np.random.default_rng(22).random((30, 2))
+    mu, sd = gp.predict(Xte, return_std=True)
+    assert np.all(np.isfinite(mu)) and np.all(sd >= 0)
+    assert gp.nu_ > 0
+
+
+def test_nu_property_matches_fixed_setting_when_not_estimated():
+    X, y = _sine_data(100, seed=23)
+    gp = ScaledVecchiaGP(m_est=8, m_pred=15, n_est=100, nu=2.5,
+                          random_state=0).fit(X, y)
+    assert gp._estimate_nu is False
+    assert gp.nu_ == 2.5

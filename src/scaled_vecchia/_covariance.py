@@ -34,6 +34,8 @@ import math
 import numpy as np
 from numba import njit, prange
 
+from ._matern_general import _block_cov_general
+
 LOG2PI = math.log(2.0 * math.pi)
 _SQRT3 = math.sqrt(3.0)
 _SQRT5 = math.sqrt(5.0)
@@ -71,8 +73,8 @@ def _matern_g(r: np.ndarray, nu: float) -> np.ndarray:
 
 
 def _check_nu(nu: float) -> None:
-    if nu not in (0.5, 1.5, 2.5):
-        raise ValueError("nu must be one of 0.5, 1.5, 2.5")
+    if not (isinstance(nu, (int, float)) and nu > 0.0):
+        raise ValueError("nu must be a positive number")
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +156,14 @@ def _block_cov(Xb, ranges, variance, nugget, nu, derivs=True, nug_mask=None):
     ranges    : (d,)  lambda_l
     variance  : sigma^2
     nugget    : tau (relative)
+    nu        : Matern smoothness. nu in {0.5, 1.5, 2.5} uses the fast,
+                Numba-compiled closed-form kernels; any other positive value
+                transparently falls back to the general Bessel-based Matern
+                (`_matern_general._block_cov_general`), which is not
+                Numba-accelerated and is correspondingly slower per block.
+                To *estimate* nu rather than fix it, see `ScaledVecchiaGP`
+                (which handles the extra derivative w.r.t. nu itself via
+                `_block_cov_general(..., estimate_nu=True)` directly).
     nug_mask  : (B, K) bool/float or None. Which diagonal entries receive the
                 nugget. None means "all of them". Used for noise-free
                 prediction.
@@ -165,6 +175,13 @@ def _block_cov(Xb, ranges, variance, nugget, nu, derivs=True, nug_mask=None):
              log sigma^2, log lambda_1..d, log tau   (or None).
     """
     _check_nu(nu)
+    if nu not in (0.5, 1.5, 2.5):
+        # General smoothness fixed (not estimated): use the Bessel-based
+        # covariance, but without the extra nu-derivative row.
+        return _block_cov_general(Xb, ranges, variance, nugget, nu,
+                                   derivs=derivs, nug_mask=nug_mask,
+                                   estimate_nu=False)
+
     B, K, _d = Xb.shape
     Xb = np.ascontiguousarray(Xb, dtype=np.float64)
     ranges = np.ascontiguousarray(ranges, dtype=np.float64)

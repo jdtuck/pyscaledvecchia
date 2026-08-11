@@ -58,26 +58,42 @@ import math
 import numpy as np
 
 from ._covariance import LOG2PI, _backsolve_LT, _batch_chol, _block_cov, _chunks, _forward_solve
+from ._matern_general import _block_cov_general
 
 __all__ = ["vecchia_profile_loglik"]
 
 
-def vecchia_profile_loglik(theta, Xo, yo, Zo, groups, nu,
+def vecchia_profile_loglik(theta, Xo, yo, Zo, groups, nu, estimate_nu=False,
                             need_grad=True, var_penalty=0.0, log_var_target=0.0):
     """Profile Vecchia loglikelihood, its gradient and the Fisher information.
 
-    theta : (d+2,) = log(sigma^2), log(lambda_1..d), log(tau)
+    theta : (P,) parameter vector on the log scale. Layout is
+            [log sigma^2, log lambda_1..d, log tau] (P = d+2) when
+            `estimate_nu` is False (`nu` is then the *fixed* smoothness), or
+            [log sigma^2, log lambda_1..d, log nu, log tau] (P = d+3) when
+            `estimate_nu` is True (`nu` is then only the current iterate's
+            value on the *natural* scale, used only for reference/logging by
+            the caller -- theta[1+d] is authoritative).
     Xo    : (n, d) inputs **in Vecchia order**
     yo    : (n,)   responses in Vecchia order
     Zo    : (n, q) mean-function design matrix in Vecchia order, or None
     groups: output of ordering._nn_groups
+    estimate_nu : if True, use the general Bessel-based Matern covariance and
+            estimate nu itself as an extra parameter (Sec. 3.5 of the paper;
+            see `_matern_general.py`). Not Numba-accelerated, so noticeably
+            slower per block than the default fixed nu in {0.5, 1.5, 2.5}.
     """
     theta = np.asarray(theta, dtype=float)
     d = Xo.shape[1]
-    P = d + 2
     variance = math.exp(theta[0])
     ranges = np.exp(theta[1:1 + d])
-    nugget = math.exp(theta[1 + d])
+    if estimate_nu:
+        nu = math.exp(theta[1 + d])
+        nugget = math.exp(theta[2 + d])
+        P = d + 3
+    else:
+        nugget = math.exp(theta[1 + d])
+        P = d + 2
     n = Xo.shape[0]
 
     has_Z = Zo is not None and Zo.shape[1] > 0
@@ -98,8 +114,12 @@ def vecchia_profile_loglik(theta, Xo, yo, Zo, groups, nu,
         for a0, a1 in _chunks(len(rows), K, P if need_grad else 1):
             sl = slice(a0, a1)
             block = idx[sl]
-            Sig, dS = _block_cov(Xo[block], ranges, variance, nugget, nu,
-                                  derivs=need_grad)
+            if estimate_nu:
+                Sig, dS = _block_cov_general(Xo[block], ranges, variance, nugget,
+                                              nu, derivs=need_grad, estimate_nu=True)
+            else:
+                Sig, dS = _block_cov(Xo[block], ranges, variance, nugget, nu,
+                                      derivs=need_grad)
             L = _batch_chol(Sig)
 
             E = np.zeros((a1 - a0, K, 1))

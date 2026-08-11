@@ -1,4 +1,6 @@
-# scaled-vecchia
+[![Pipeline Status](https://github.com/jdtuck/pyscaledvecchia/actions/workflows/matlab.yml/badge.svg)](https://github.com/jdtuck/pyscaledvecchia/actions/workflows/matlab.yml)
+
+# pyscaledvecchia
 
 A NumPy/SciPy implementation of
 
@@ -31,20 +33,39 @@ fitting, 140 for prediction). It does this by:
 5. Optionally **correcting predictive variances** by a scalar factor `b`
    estimated on a held-out inner split (Sec. 3.4).
 
-The covariance function is an isotropic Matern with half-integer smoothness
-(`nu` in `{0.5, 1.5, 2.5}`, closed form — no Bessel function calls) plus a
-relative nugget:
+The covariance function is an isotropic Matern plus a relative nugget:
 
 ```
 K(x_i, x_j) = sigma^2 * [ M_nu(q_ij) + tau * 1{i == j} ]
 q_ij        = sqrt( sum_l ((x_il - x_jl) / lambda_l)^2 )
 ```
 
-All parameters (`sigma^2`, `lambda_1..d`, `tau`) are optimized on the log
-scale so positivity is automatic.
+`nu` (smoothness) can be:
+
+- fixed at `0.5`, `1.5`, or `2.5` (the default is `2.5`) -- closed-form
+  Matern, no Bessel function calls, and Numba-accelerated;
+- fixed at any other positive value -- falls back to the general
+  Bessel-based Matern (`scipy.special.kv`), which is not Numba-accelerated
+  and so is slower per conditioning-set block;
+- or **estimated** by passing `nu=None`, following Sec. 3.5 of the paper and
+  matching its own reference R implementation (`GpGp`/`GPvecchia`, which
+  estimates nu jointly with the other covariance parameters via Fisher
+  scoring when it isn't fixed by the user, starting from an initial
+  smoothness of 3.5). This always uses the general Bessel-based path, since
+  the derivative of a Bessel function with respect to its *order* has no
+  closed form -- see `_matern_general.py` for exactly how the gradient and
+  Fisher information for nu are computed (analytic where possible, a
+  central finite difference only for the one component that genuinely has
+  none). Note that `nu` is a famously hard covariance parameter to pin down
+  precisely from finite data (see e.g. Zhang 2004 on infill asymptotics for
+  the Matern family); treat point estimates of it accordingly.
+
+All parameters (`sigma^2`, `lambda_1..d`, `nu` if estimated, `tau`) are
+optimized on the log scale so positivity is automatic.
 
 Pure NumPy/SciPy/Numba — no compiled extension to build (Numba JIT-compiles
-the hot loops at runtime and caches them to disk).
+the hot loops at runtime and caches them to disk). The general/estimated-nu
+path additionally uses `scipy.special.kv` (not Numba-compatible).
 
 ## Installation
 
@@ -76,12 +97,16 @@ mean, sd = gp.predict(X_test, return_std=True)
 draws = gp.sample_joint(X_path, n_sim=100)   # shape (100, len(X_path))
 
 print(gp.summary())
+
+# To estimate the Matern smoothness instead of fixing it:
+gp2 = ScaledVecchiaGP(m_est=30, m_pred=140, nu=None).fit(X_train, y_train)
+print(gp2.nu_)   # the fitted smoothness
 ```
 
-`gp.summary()` prints the fitted variance, nugget, variance-correction
-factor `b`, and the estimated input *relevances* `1 / lambda_l` (larger =
-more influential input), which is a convenient one-line sensitivity
-analysis for computer-model emulation.
+`gp.summary()` prints the fitted variance, smoothness, nugget,
+variance-correction factor `b`, and the estimated input *relevances*
+`1 / lambda_l` (larger = more influential input), which is a convenient
+one-line sensitivity analysis for computer-model emulation.
 
 ### Key options on `ScaledVecchiaGP`
 
@@ -90,7 +115,7 @@ analysis for computer-model emulation.
 | `m_est` | 30 | Conditioning-set size used during likelihood optimization. |
 | `m_pred` | 140 | Conditioning-set size used at prediction time (larger = more accurate, slower). |
 | `n_est` | 5000 | Subsample size used for parameter estimation (fitting is `O(n_est * m_est^3)`). |
-| `nu` | 2.5 | Matern smoothness; one of `0.5`, `1.5`, `2.5`. |
+| `nu` | 2.5 | Matern smoothness: `0.5`/`1.5`/`2.5` (fast), any other fixed positive float (general Bessel-based), or `None` to estimate it. |
 | `trend` | `"constant"` | Mean function: `"zero"`, `"constant"`, or `"linear"`. |
 | `nugget` | `None` | `None` estimates a relative nugget; a float (e.g. `1e-8`) fixes it — useful for deterministic computer models. |
 | `var_correction` | `True` | Estimate the Sec. 3.4 predictive-variance inflation factor `b` on an inner split. |
@@ -109,7 +134,7 @@ See the docstring on `ScaledVecchiaGP` for the full list.
 - `ScaledVecchiaGP.sample_joint(X, n_sim=100, m=None)` — convenience wrapper
   returning just the sample paths, shape `(n_sim, len(X))`.
 - `ScaledVecchiaGP.summary()` — human-readable fit summary.
-- Fitted attributes: `variance_`, `ranges_`, `relevance_`, `nugget_`,
+- Fitted attributes: `variance_`, `ranges_`, `relevance_`, `nu_`, `nugget_`,
   `beta_`, `loglik_`, `b_`.
 
 Lower-level building blocks are also exported for anyone who wants to
@@ -189,9 +214,11 @@ and draws joint sample paths along a path through input space.
   ordering, which is fine up to roughly `n ~ 10^4`–`10^5`. The paper uses the
   quasilinear-time algorithm of Schafer, Sullivan & Owhadi (2021) for larger
   `n`.
-- **Covariance.** Only the isotropic Matern family with half-integer
-  smoothness (`nu = 0.5, 1.5, 2.5`) is implemented (closed form, no Bessel
-  calls). General `nu` is not supported.
+- **Covariance.** The fast, Numba-accelerated path covers the isotropic
+  Matern family with half-integer smoothness (`nu = 0.5, 1.5, 2.5`, closed
+  form, no Bessel calls). Any other fixed `nu`, or `nu=None` to estimate it,
+  is supported via a general Bessel-based Matern (`_matern_general.py`) but
+  is not Numba-accelerated, so is correspondingly slower per block.
 - No compiled/GPU backend — everything is vectorized NumPy/SciPy, batched
   over conditioning-set blocks.
 
