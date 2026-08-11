@@ -46,7 +46,11 @@ q_ij        = sqrt( sum_l ((x_il - x_jl) / lambda_l)^2 )
   Matern, no Bessel function calls, and Numba-accelerated;
 - fixed at any other positive value -- falls back to the general
   Bessel-based Matern (`scipy.special.kv`), which is not Numba-accelerated
-  and so is slower per conditioning-set block;
+  and so is slower per conditioning-set block (this path exploits the
+  symmetry of the distance matrix to only evaluate the Bessel function on
+  each block's K(K+1)/2 unique entries rather than all K^2, roughly a 2x
+  saving over the naive approach, but it is still meaningfully slower than
+  the closed-form nu in {0.5, 1.5, 2.5});
 - or **estimated** by passing `nu=None`, following Sec. 3.5 of the paper and
   matching its own reference R implementation (`GpGp`/`GPvecchia`, which
   estimates nu jointly with the other covariance parameters via Fisher
