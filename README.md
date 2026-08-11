@@ -1,4 +1,4 @@
-[![Pipeline Status](https://github.com/jdtuck/pyscaledvecchia/actions/workflows/matlab.yml/badge.svg)](https://github.com/jdtuck/pyscaledvecchia/actions/workflows/matlab.yml)
+[![Pipeline Status](https://github.com/jdtuck/pyscaledvecchia/actions/workflows/Build.yml/badge.svg)](https://github.com/jdtuck/pyscaledvecchia/actions/workflows/Build.yml)
 
 # pyscaledvecchia
 
