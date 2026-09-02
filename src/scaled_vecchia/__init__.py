@@ -19,12 +19,14 @@ See the package README for a full description of the method. Quick start::
 from .gp import ScaledVecchiaGP
 from .likelihood import vecchia_profile_loglik
 from .ordering import find_ordered_nn, maximin_order
+from .scaledVecchia4mvBayes import scaledVecchia4mvBayes
 
 __all__ = [
     "ScaledVecchiaGP",
     "maximin_order",
     "find_ordered_nn",
     "vecchia_profile_loglik",
+    "scaledVecchia4mvBayes",
 ]
 
 __version__ = "0.1.0"
