@@ -15,7 +15,7 @@ Default synthetic posterior sample count:
 
 import numpy as np
 
-from scaled_vecchia import ScaledVecchiaGP
+from .gp import ScaledVecchiaGP
 
 
 class _MvBayesScaledVecchiaSamples:
