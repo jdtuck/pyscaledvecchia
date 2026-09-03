@@ -78,16 +78,25 @@ class MvBayesScaledVecchiaWrapper:
         Xtest : array-like
             Test predictors.
         idxSamples : None or array-like of int
-            Posterior sample indices to retain. If None, all synthetic posterior draws are returned.
+            If None, return self.nSamples draws.
+            If provided, generate only len(idxSamples) draws and return them.
 
         Returns
         -------
         np.ndarray
             Shape (n_samples_selected, n_obs), compatible with mvBayes.
         """
+        if idxSamples is None:
+            n_draws = self.nSamples
+        else:
+            idxSamples = np.asarray(idxSamples)
+            if idxSamples.ndim == 0:
+                idxSamples = idxSamples.reshape(1)
+            n_draws = len(idxSamples)
+
         samples = self.model.sample_joint(
             Xtest,
-            n_sim=self.nSamples,
+            n_sim=n_draws,
             random_state=self.random_state,
         )
 
@@ -97,10 +106,6 @@ class MvBayesScaledVecchiaWrapper:
             raise ValueError(
                 f"Expected joint samples with 2 dimensions, got shape {samples.shape}."
             )
-
-        if idxSamples is not None:
-            idxSamples = np.asarray(idxSamples, dtype=int)
-            samples = samples[idxSamples, :]
 
         return samples
 
