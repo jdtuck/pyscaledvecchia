@@ -357,7 +357,7 @@ class ScaledVecchiaGP:
         # rows of U_op are indexed by position in the *observation ordering*
         return U_op, U_pp, order[n:] - n, order_obs
 
-    def predict_joint(self, Xstar, m=None, n_sim=0, exact_var=False,
+    def predict_joint(self, Xstar, m=None, n_sim=0, exact_var=False, return_var=True,
                        random_state=None):
         """Joint Vecchia predictive distribution (Sec. 3.3).
 
@@ -397,14 +397,19 @@ class ScaledVecchiaGP:
             dr = spsolve_triangular(Lt, eps, lower=True)[inv]
             samples = (mu[:, None] + math.sqrt(self.b_) * dr).T
             out["samples"] = self._ymu + self._ysd * samples
-            if "var" not in out:
+            if return_var and "var" not in out:
                 out["var"] = out["samples"].var(0, ddof=1)
         return out
 
     def sample_joint(self, Xstar, n_sim=100, m=None, random_state=None):
         """Draw joint sample paths from the predictive distribution."""
-        return self.predict_joint(Xstar, m=m, n_sim=n_sim,
-                                   random_state=random_state)["samples"]
+        return self.predict_joint(
+            Xstar,
+            m=m,
+            n_sim=n_sim,
+            random_state=random_state,
+            return_var=False,
+        )["samples"]
 
     # ---------------- variance correction ----------------------------------
     def _estimate_b(self, rng):
