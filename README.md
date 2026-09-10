@@ -317,6 +317,41 @@ Fits an emulator to the 8-dimensional borehole function (only ~3 inputs
 matter), reports RMSE and 95% interval coverage against a held-out test set,
 and draws joint sample paths along a path through input space.
 
+## Scaling benchmark
+
+```bash
+pip install -e ".[demo]"   # matplotlib, for optional --plot output
+python benchmarks/scaling_benchmark.py --sweep all
+python benchmarks/scaling_benchmark.py --sweep fit_n_est --plot --csv results.csv
+python benchmarks/scaling_benchmark.py --quick   # small sizes, fast smoke run
+```
+
+A standalone script (not collected by `pytest`) that empirically measures
+wall-clock scaling for `fit()` and every `predict`-family method against the
+complexities documented above and in "Notes / limitations" below: `fit()`
+time vs `n_est` and vs `m_est`, `fit()`'s plateau once `n` exceeds `n_est`,
+marginal `predict()` time vs training-set size and vs number of query
+points, `prepare_joint()`'s one-time setup cost vs training-set size (the
+exact O(n^2) maximin ordering), and a head-to-head comparison of naive
+repeated `sample_joint()` calls against `prepare_joint()` + repeated
+`.sample()` (the MCMC-loop pattern from "Repeated prediction" above). Each
+"vs size" sweep fits an approximate power-law exponent via log-log
+regression so the empirical complexity is a single comparable number, not
+just a table to eyeball; run with `--csv`/`--plot` to save results for
+comparing across machines or branches. See the script's module docstring
+for the full list of sweeps and some caveats on interpreting the fitted
+exponents at moderate problem sizes (fixed per-call overhead can dilute a
+fitted exponent below its true asymptotic value until the size range is
+wide enough).
+
+A small, fast, **opt-in** pytest module (skipped by default -- see its
+docstring for why) checks a few of the same scaling properties as coarse
+regression guards rather than precise measurements:
+
+```bash
+RUN_SCALING_TESTS=1 pytest tests/test_scaling.py -v
+```
+
 ## Notes / limitations relative to the paper
 
 - **Ordering.** This implementation uses the simple exact `O(n^2 d)` maximin
