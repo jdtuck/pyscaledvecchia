@@ -61,6 +61,7 @@ class JointPredictiveCache:
     ysd: float
     b: float
     _var: np.ndarray = field(default=None, repr=False)   # lazily computed, original scale
+    _u_pp: float | None = field(default=None, repr=False)
 
     @property
     def mean(self) -> np.ndarray:
@@ -73,9 +74,12 @@ class JointPredictiveCache:
         Computed on first access and cached (another sparse triangular
         solve against the cached factorization, not the full setup)."""
         if self._var is None:
-            S = spsolve_triangular(self.Lt, np.eye(self.ns), lower=True)
-            v = (S ** 2).sum(1)[self.inv]
-            self._var = (self.ysd ** 2) * self.b * v
+            if self._u_pp is not None:
+                self._var = np.array([(self.ysd ** 2) * self.b / (self._u_pp ** 2)])
+            else:
+                S = spsolve_triangular(self.Lt, np.eye(self.ns), lower=True)
+                v = (S ** 2).sum(1)[self.inv]
+                self._var = (self.ysd ** 2) * self.b * v
         return self._var
 
     def sample(self, n_sim: int = 100, random_state=None) -> np.ndarray:
@@ -91,6 +95,10 @@ class JointPredictiveCache:
         independent of that stream.
         """
         rng = self._gp._get_rng(random_state)
+        if self._u_pp is not None:
+            dr = rng.standard_normal(n_sim) / self._u_pp
+            samples = self.mu[0] + math.sqrt(self.b) * dr
+            return (self.ymu + self.ysd * samples).reshape(n_sim, 1)
         eps = rng.standard_normal((self.ns, n_sim))
         dr = spsolve_triangular(self.Lt, eps, lower=True)[self.inv]
         samples = (self.mu[:, None] + math.sqrt(self.b) * dr).T
@@ -159,6 +167,13 @@ class ScaledVecchiaGP:
     _nu_fit: float = field(default=None, init=False, repr=False)
     _order_obs_cache: np.ndarray = field(default=None, init=False, repr=False)
     _rng: np.random.Generator = field(default=None, init=False, repr=False)
+    _Z_tr_cache: np.ndarray = field(default=None, init=False, repr=False)
+    _resid_cache: np.ndarray = field(default=None, init=False, repr=False)
+    _X_scaled_cache: np.ndarray = field(default=None, init=False, repr=False)
+    _X_obs_ord_cache: np.ndarray = field(default=None, init=False, repr=False)
+    _X_scaled_obs_ord_cache: np.ndarray = field(default=None, init=False, repr=False)
+    _resid_obs_ord_cache: np.ndarray = field(default=None, init=False, repr=False)
+    _pred_tree_cache: cKDTree = field(default=None, init=False, repr=False)
 
     # ---------------- basis / scaling helpers ------------------------------
     def _design(self, X):
@@ -224,6 +239,26 @@ class ScaledVecchiaGP:
         theta[-1] = np.clip(theta[-1], math.log(1e-12), math.log(1e3))
         return theta
 
+    def _refresh_prediction_cache(self):
+        self._Z_tr_cache = self._design(self.X_)
+        self._resid_cache = self.y_ - (
+            self._Z_tr_cache @ self.beta_ if self.beta_.size else 0.0
+        )
+        self._X_scaled_cache = self.X_ / self.ranges_
+        self._pred_tree_cache = cKDTree(self._X_scaled_cache)
+
+        self._X_obs_ord_cache = None
+        self._X_scaled_obs_ord_cache = None
+        self._resid_obs_ord_cache = None
+
+    def _ensure_obs_order_cache(self):
+        if self._order_obs_cache is None:
+            self._order_obs_cache = maximin_order(self._X_scaled_cache)
+        if self._X_obs_ord_cache is None:
+            self._X_obs_ord_cache = self.X_[self._order_obs_cache]
+            self._X_scaled_obs_ord_cache = self._X_scaled_cache[self._order_obs_cache]
+            self._resid_obs_ord_cache = self._resid_cache[self._order_obs_cache]
+            
     # ---------------- fitting ----------------------------------------------
     def fit(self, X, y):
         X = np.ascontiguousarray(np.atleast_2d(X), dtype=float)
@@ -238,6 +273,13 @@ class ScaledVecchiaGP:
         num_threads = self._resolve_num_threads()
         self._order_obs_cache = None   # invalidate: depends on X_/ranges_, both about to change
         self._rng = None               # reset the persistent sampling stream too
+        self._Z_tr_cache = None
+        self._resid_cache = None
+        self._X_scaled_cache = None
+        self._X_obs_ord_cache = None
+        self._X_scaled_obs_ord_cache = None
+        self._resid_obs_ord_cache = None
+        self._pred_tree_cache = None
 
         # Standardise the input box to [0,1]^d so that 1/lambda_l is comparable
         # across dimensions, and centre/scale y for numerical conditioning.
@@ -325,6 +367,7 @@ class ScaledVecchiaGP:
         self.beta_ = beta
         self.loglik_ = ll
         self._nu_fit = math.exp(theta[1 + d]) if estimate_nu else self.nu
+        self._refresh_prediction_cache()
 
         # ---- variance correction (Sec. 3.4) --------------------------------
         self.b_ = 1.0
@@ -371,6 +414,44 @@ class ScaledVecchiaGP:
             varn[sl] = dv
         return mean, varn
 
+    def _predict_scaled_cached(self, Xs_std, m, noise_free=True):
+        """Cached-training variant of `_predict_scaled` for repeated predict()."""
+        ranges = self.ranges_
+        var = self.variance_
+        nug = self.nugget_
+        m = min(m, self.X_.shape[0])
+
+        _, nb = self._pred_tree_cache.query(Xs_std / ranges, k=m)
+        nb = np.asarray(nb)
+        if m == 1:
+            nb = nb.reshape(-1, 1)
+        else:
+            nb = np.atleast_2d(nb)
+
+        K = m + 1
+        mean = np.empty(Xs_std.shape[0])
+        varn = np.empty(Xs_std.shape[0])
+        for a0, a1 in _chunks(Xs_std.shape[0], K, 1):
+            sl = slice(a0, a1)
+            Xb = np.concatenate([self.X_[nb[sl]], Xs_std[sl][:, None, :]], axis=1)
+            mask = np.ones((a1 - a0, K), dtype=float)
+            if noise_free:
+                mask[:, K - 1] = 0.0
+            Sig, _ = _block_cov(
+                Xb, ranges, var, nug, self.nu_,
+                derivs=False, nug_mask=mask,
+                num_threads=self._resolve_num_threads(),
+            )
+            L = _batch_chol(Sig)
+            E = np.zeros((a1 - a0, K, 1))
+            E[:, K - 1, 0] = 1.0
+            av = _backsolve_LT(L, E)[:, :, 0]
+            dv = 1.0 / av[:, K - 1] ** 2
+            mean[sl] = -np.einsum("bk,bk->b", av[:, :m], self._resid_cache[nb[sl]]) \
+                       / av[:, K - 1]
+            varn[sl] = dv
+        return mean, varn
+
     def predict(self, Xstar, return_std=False, return_var=False, m=None):
         """Marginal predictive mean (and sd/variance) at new inputs.
 
@@ -383,9 +464,7 @@ class ScaledVecchiaGP:
         Xs = (Xstar - self._lo) / self._span
         m = self.m_pred if m is None else m
 
-        Z_tr = self._design(self.X_)
-        resid = self.y_ - (Z_tr @ self.beta_ if self.beta_.size else 0.0)
-        mu, va = self._predict_scaled(Xs, self.X_, resid, m)
+        mu, va = self._predict_scaled_cached(Xs, m)
         Zs = self._design(Xs)
         if self.beta_.size:
             mu = mu + Zs @ self.beta_
@@ -415,17 +494,19 @@ class ScaledVecchiaGP:
         recomputed from scratch every time (the previous behaviour). The
         cache is invalidated at the start of `fit()`.
         """
+        self._ensure_obs_order_cache()
+        
         n, d = self.X_.shape
         ns = Xs.shape[0]
         ranges = self.ranges_
         var, nug = self.variance_, self.nugget_
 
         if self._order_obs_cache is None:
-            self._order_obs_cache = maximin_order(self.X_ / ranges)
+            self._order_obs_cache = maximin_order(self._X_scaled_cache)
         order_obs = self._order_obs_cache
 
         Xall = np.vstack([self.X_, Xs])
-        Xsc = Xall / ranges
+        Xsc = np.vstack([self._X_scaled_cache, Xs / ranges])
         order_pred = maximin_order(Xsc[n:]) + n
         order = np.concatenate([order_obs, order_pred])       # observations first
         Xo_sc = Xsc[order]
@@ -433,9 +514,12 @@ class ScaledVecchiaGP:
         nn = find_ordered_nn(Xo_sc, min(m, n), start=n)       # only pred rows needed
         Xo = Xall[order]
 
-        rows_i, cols_j, vals = [], [], []
         K = min(m, n) + 1
+        rows_i = np.empty(ns * K, dtype=np.int64)
+        cols_j = np.empty(ns * K, dtype=np.int64)
+        vals = np.empty(ns * K, dtype=float)
         pred_rows = np.arange(n, n + ns)
+        ptr = 0
         for a0, a1 in _chunks(ns, K, 1):
             sl = slice(a0, a1)
             r = pred_rows[sl]
@@ -451,19 +535,54 @@ class ScaledVecchiaGP:
             E = np.zeros((a1 - a0, K, 1))
             E[:, K - 1, 0] = 1.0
             av = _backsolve_LT(L, E)[:, :, 0]                 # = column of U
-            rows_i.append(block.ravel())
-            cols_j.append(np.repeat(np.arange(a0, a1), K))
-            vals.append(av.ravel())
+            nnz = (a1 - a0) * K
+            rows_i[ptr:ptr + nnz] = block.ravel()
+            cols_j[ptr:ptr + nnz] = np.repeat(np.arange(a0, a1), K)
+            vals[ptr:ptr + nnz] = av.ravel()
+            ptr += nnz
 
-        rows_i = np.concatenate(rows_i)
-        cols_j = np.concatenate(cols_j)
-        vals = np.concatenate(vals)
         Ufull = sparse.coo_matrix((vals, (rows_i, cols_j)),
                                    shape=(n + ns, ns)).tocsc()
         U_op = Ufull[:n, :]
         U_pp = Ufull[n:, :]                                   # upper triangular
         # rows of U_op are indexed by position in the *observation ordering*
         return U_op, U_pp, order[n:] - n, order_obs
+
+    def _joint_factor_one(self, Xs, m):
+        """Fast path data for the single-point joint predictive case."""
+        self._ensure_obs_order_cache()
+        
+        n = self.X_.shape[0]
+        ranges = self.ranges_
+        var, nug = self.variance_, self.nugget_
+        K = min(m, n) + 1
+
+        xs = np.asarray(Xs, dtype=float).reshape(1, -1)
+        xs_sc = xs / ranges
+        Xo_sc = np.vstack([self._X_scaled_obs_ord_cache, xs_sc])
+        Xo = np.vstack([self._X_obs_ord_cache, xs])
+
+        nn = find_ordered_nn(Xo_sc, min(m, n), start=n)
+        r = n
+        nbrs = nn[r:r + 1, 1:K]
+        block = np.concatenate([nbrs, np.array([[r]], dtype=nn.dtype)], axis=1)
+
+        mask = np.ones((1, K), dtype=float)
+        mask[:, K - 1] = 0.0
+        mask[:, :K - 1] = (block[:, :K - 1] < n).astype(float)
+        Sig, _ = _block_cov(
+            Xo[block], ranges, var, nug, self.nu_,
+            derivs=False, nug_mask=mask,
+            num_threads=self._resolve_num_threads(),
+        )
+        L = _batch_chol(Sig)
+        E = np.zeros((1, K, 1))
+        E[:, K - 1, 0] = 1.0
+        av = _backsolve_LT(L, E)[0, :, 0]
+
+        u_obs = np.zeros(n, dtype=float)
+        u_obs[block[0, :-1]] = av[:-1]
+        return u_obs, float(av[-1])
 
     def predict_joint(self, Xstar, m=None, n_sim=0, exact_var=False, return_var=True,
                        random_state=None):
@@ -527,15 +646,36 @@ class ScaledVecchiaGP:
         m = self.m_pred if m is None else m
         ns = Xs.shape[0]
 
+        if ns == 1:
+            u_obs, u_pp = self._joint_factor_one(Xs[0], m)
+            mu = float(-(u_obs @ self._resid_obs_ord_cache) / u_pp)
+            Zs = self._design(Xs)
+            if self.beta_.size:
+                mu += float((Zs @ self.beta_)[0])
+
+            var = None
+            if exact_var:
+                var = np.array([(self._ysd ** 2) * self.b_ / (u_pp ** 2)])
+
+            return JointPredictiveCache(
+                _gp=self,
+                Lt=None,
+                inv=np.array([0], dtype=np.int64),
+                mu=np.array([mu]),
+                ns=1,
+                ymu=self._ymu,
+                ysd=self._ysd,
+                b=self.b_,
+                _var=var,
+                _u_pp=u_pp,
+            )
+
         U_op, U_pp, perm, order_obs = self._joint_factor(Xs, m)
         inv = np.empty(ns, dtype=np.int64)
         inv[perm] = np.arange(ns)                    # ordering -> original rows
 
-        Z_tr = self._design(self.X_)
-        resid = self.y_ - (Z_tr @ self.beta_ if self.beta_.size else 0.0)
-
         Lt = U_pp.T.tocsr()                          # lower triangular
-        rhs = -(U_op.T @ resid[order_obs])
+        rhs = -(U_op.T @ self._resid_obs_ord_cache)
         mu_ord = spsolve_triangular(Lt, rhs, lower=True)
         mu = mu_ord[inv]
         Zs = self._design(Xs)
@@ -606,3 +746,4 @@ class ScaledVecchiaGP:
         for l, rel in enumerate(self.relevance_):
             s.append(f"      x[{l}] : {rel:10.4f}")
         return "\n".join(s)
+        
