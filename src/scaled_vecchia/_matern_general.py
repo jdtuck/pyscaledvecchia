@@ -73,20 +73,47 @@ reductions in the number of Bessel evaluations:
    differencing keeps the gradient accurate to ~1e-6 relative error.
 
 Together these cut the Bessel-evaluation cost by roughly 2x.
+
+Optional Cython/OpenMP backend
+-------------------------------
+If the optional `scaled_vecchia._matern_cy` extension was successfully
+built at install time (see `_matern_cy.pyx` and `setup.py` for what it does
+and why -- in short: fuses this whole computation into one `nogil` loop
+calling `scipy.special.cython_special.kv` directly, and can run it across
+multiple threads with OpenMP), `_block_cov_general` transparently uses it
+instead of the pure-NumPy path below. Whether it's active is exposed as
+`HAVE_CYTHON_BACKEND` in this module. The extension is validated to be
+numerically identical to the pure-Python implementation (see
+`tests/test_matern_cy.py`), so this is purely a speed optimization -- it
+changes nothing about what `ScaledVecchiaGP(nu=None)` computes or returns.
 """
 
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 from scipy.special import gammaln, kv
 
-__all__ = ["_matern_corr_general", "_matern_g_general", "_block_cov_general"]
+__all__ = ["_matern_corr_general", "_matern_g_general", "_block_cov_general",
+           "_block_cov_general_numpy", "_block_cov_general_cython",
+           "HAVE_CYTHON_BACKEND"]
+
+try:
+    from . import _matern_cy as _cy
+    HAVE_CYTHON_BACKEND = True
+except ImportError:
+    _cy = None
+    HAVE_CYTHON_BACKEND = False
 
 _R_FLOOR = 1e-7   # keeps Bessel evaluations away from the r=0 singularity;
                    # always paired with a diff term that is exactly 0 there,
                    # so this floor introduces no error in derivatives.
+
+
+def _default_num_threads() -> int:
+    return os.cpu_count() or 1
 
 
 def _matern_corr_general(r: np.ndarray, nu: float) -> np.ndarray:
@@ -131,16 +158,12 @@ def _symmetric_eval(func, r_full, iu):
     return out
 
 
-def _block_cov_general(Xb, ranges, variance, nugget, nu, derivs=True,
-                        nug_mask=None, estimate_nu=False, nu_fd_h=1e-3):
-    """Like `_covariance._block_cov`, but for a general (possibly estimated)
-    Matern smoothness `nu`, via the Bessel-based formulas above.
-
-    When `estimate_nu` is True, `dS` gets one extra derivative row (w.r.t.
-    log nu), inserted right after the range derivatives and before the
-    nugget derivative: columns are
-    [log sigma^2, log lambda_1..d, log nu, log tau].
-    """
+def _block_cov_general_numpy(Xb, ranges, variance, nugget, nu, derivs=True,
+                              nug_mask=None, estimate_nu=False, nu_fd_h=1e-3):
+    """Pure NumPy/SciPy implementation (see `_block_cov_general` for the
+    public dispatcher, which prefers the Cython/OpenMP backend when it's
+    available). Exposed separately so it can be tested directly against
+    the compiled backend regardless of which one is active by default."""
     B, K, d = Xb.shape
     U = Xb / ranges
     diff = U[:, :, None, :] - U[:, None, :, :]        # (B,K,K,d)
@@ -177,3 +200,44 @@ def _block_cov_general(Xb, ranges, variance, nugget, nu, derivs=True,
         idx += 1
     dS[:, idx] = variance * nug_diag                   # d/d log tau
     return Sigma, dS
+
+
+def _block_cov_general_cython(Xb, ranges, variance, nugget, nu, derivs=True,
+                               nug_mask=None, estimate_nu=False, nu_fd_h=1e-3,
+                               num_threads=None):
+    """Thin wrapper around the compiled `_matern_cy` extension, only valid
+    to call when `HAVE_CYTHON_BACKEND` is True. Exposed separately (like
+    `_block_cov_general_numpy`) so tests can call it directly."""
+    Xb = np.ascontiguousarray(Xb, dtype=np.float64)
+    ranges = np.ascontiguousarray(ranges, dtype=np.float64)
+    mask = None if nug_mask is None else np.ascontiguousarray(nug_mask, dtype=np.float64)
+    nt = num_threads or _default_num_threads()
+    return _cy.block_cov_general_cy(Xb, ranges, float(variance), float(nugget),
+                                     float(nu), bool(derivs), mask,
+                                     bool(estimate_nu), float(nu_fd_h), int(nt))
+
+
+def _block_cov_general(Xb, ranges, variance, nugget, nu, derivs=True,
+                        nug_mask=None, estimate_nu=False, nu_fd_h=1e-3,
+                        num_threads=None):
+    """Like `_covariance._block_cov`, but for a general (possibly estimated)
+    Matern smoothness `nu`, via the Bessel-based formulas above.
+
+    When `estimate_nu` is True, `dS` gets one extra derivative row (w.r.t.
+    log nu), inserted right after the range derivatives and before the
+    nugget derivative: columns are
+    [log sigma^2, log lambda_1..d, log nu, log tau].
+
+    `num_threads` only affects the optional Cython/OpenMP backend (see
+    module docstring); it is silently ignored by the pure-NumPy fallback,
+    which is always single-threaded. `None` means "use all available
+    cores" when that backend is active.
+    """
+    if HAVE_CYTHON_BACKEND:
+        return _block_cov_general_cython(Xb, ranges, variance, nugget, nu,
+                                          derivs=derivs, nug_mask=nug_mask,
+                                          estimate_nu=estimate_nu, nu_fd_h=nu_fd_h,
+                                          num_threads=num_threads)
+    return _block_cov_general_numpy(Xb, ranges, variance, nugget, nu,
+                                     derivs=derivs, nug_mask=nug_mask,
+                                     estimate_nu=estimate_nu, nu_fd_h=nu_fd_h)

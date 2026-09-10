@@ -18,6 +18,7 @@ See the package README for a full description of the method. Quick start::
 
 from .gp import ScaledVecchiaGP
 from .likelihood import vecchia_profile_loglik
+from ._matern_general import HAVE_CYTHON_BACKEND
 from .ordering import find_ordered_nn, maximin_order
 from .scaledVecchia4mvBayes import scaledVecchia4mvBayes
 
@@ -27,6 +28,7 @@ __all__ = [
     "find_ordered_nn",
     "vecchia_profile_loglik",
     "scaledVecchia4mvBayes",
+    "HAVE_CYTHON_BACKEND",
 ]
 
 __version__ = "0.1.0"

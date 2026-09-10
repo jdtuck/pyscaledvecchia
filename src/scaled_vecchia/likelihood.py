@@ -64,7 +64,8 @@ __all__ = ["vecchia_profile_loglik"]
 
 
 def vecchia_profile_loglik(theta, Xo, yo, Zo, groups, nu, estimate_nu=False,
-                            need_grad=True, var_penalty=0.0, log_var_target=0.0):
+                            need_grad=True, var_penalty=0.0, log_var_target=0.0,
+                            num_threads=None):
     """Profile Vecchia loglikelihood, its gradient and the Fisher information.
 
     theta : (P,) parameter vector on the log scale. Layout is
@@ -81,7 +82,12 @@ def vecchia_profile_loglik(theta, Xo, yo, Zo, groups, nu, estimate_nu=False,
     estimate_nu : if True, use the general Bessel-based Matern covariance and
             estimate nu itself as an extra parameter (Sec. 3.5 of the paper;
             see `_matern_general.py`). Not Numba-accelerated, so noticeably
-            slower per block than the default fixed nu in {0.5, 1.5, 2.5}.
+            slower per block than the default fixed nu in {0.5, 1.5, 2.5}
+            (unless the optional Cython/OpenMP backend was built -- see
+            `_matern_general.HAVE_CYTHON_BACKEND`).
+    num_threads : only relevant when `estimate_nu` is True, or `nu` is fixed
+            at a non-half-integer value, and the Cython/OpenMP backend is
+            active; see `_matern_general._block_cov_general`.
     """
     theta = np.asarray(theta, dtype=float)
     d = Xo.shape[1]
@@ -116,10 +122,11 @@ def vecchia_profile_loglik(theta, Xo, yo, Zo, groups, nu, estimate_nu=False,
             block = idx[sl]
             if estimate_nu:
                 Sig, dS = _block_cov_general(Xo[block], ranges, variance, nugget,
-                                              nu, derivs=need_grad, estimate_nu=True)
+                                              nu, derivs=need_grad, estimate_nu=True,
+                                              num_threads=num_threads)
             else:
                 Sig, dS = _block_cov(Xo[block], ranges, variance, nugget, nu,
-                                      derivs=need_grad)
+                                      derivs=need_grad, num_threads=num_threads)
             L = _batch_chol(Sig)
 
             E = np.zeros((a1 - a0, K, 1))

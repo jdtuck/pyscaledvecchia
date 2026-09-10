@@ -147,7 +147,8 @@ def _block_cov_grad_kernel(Xb, ranges, variance, nugget, nu, nug_mask):
     return Sigma, dS
 
 
-def _block_cov(Xb, ranges, variance, nugget, nu, derivs=True, nug_mask=None):
+def _block_cov(Xb, ranges, variance, nugget, nu, derivs=True, nug_mask=None,
+                num_threads=None):
     """Covariance matrices (and d/dlog-parameter derivatives) for a batch of blocks.
 
     Parameters
@@ -159,14 +160,17 @@ def _block_cov(Xb, ranges, variance, nugget, nu, derivs=True, nug_mask=None):
     nu        : Matern smoothness. nu in {0.5, 1.5, 2.5} uses the fast,
                 Numba-compiled closed-form kernels; any other positive value
                 transparently falls back to the general Bessel-based Matern
-                (`_matern_general._block_cov_general`), which is not
-                Numba-accelerated and is correspondingly slower per block.
+                (`_matern_general._block_cov_general`), which uses the
+                optional Cython/OpenMP backend if it was built, else the
+                (single-threaded) pure NumPy/SciPy implementation.
                 To *estimate* nu rather than fix it, see `ScaledVecchiaGP`
                 (which handles the extra derivative w.r.t. nu itself via
                 `_block_cov_general(..., estimate_nu=True)` directly).
     nug_mask  : (B, K) bool/float or None. Which diagonal entries receive the
                 nugget. None means "all of them". Used for noise-free
                 prediction.
+    num_threads : only used when `nu` dispatches to the general Matern path;
+                see `_matern_general._block_cov_general`.
 
     Returns
     -------
@@ -180,7 +184,7 @@ def _block_cov(Xb, ranges, variance, nugget, nu, derivs=True, nug_mask=None):
         # covariance, but without the extra nu-derivative row.
         return _block_cov_general(Xb, ranges, variance, nugget, nu,
                                    derivs=derivs, nug_mask=nug_mask,
-                                   estimate_nu=False)
+                                   estimate_nu=False, num_threads=num_threads)
 
     B, K, _d = Xb.shape
     Xb = np.ascontiguousarray(Xb, dtype=np.float64)

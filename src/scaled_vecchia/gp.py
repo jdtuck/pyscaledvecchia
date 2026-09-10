@@ -22,6 +22,7 @@ Everything scales as O(n m^3) for estimation and O(n* m*^3) for prediction.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -30,6 +31,7 @@ from scipy.sparse.linalg import spsolve_triangular
 from scipy.spatial import cKDTree
 
 from ._covariance import _backsolve_LT, _batch_chol, _block_cov, _chunks
+from ._matern_general import HAVE_CYTHON_BACKEND
 from .likelihood import vecchia_profile_loglik
 from .optimize import _fisher_scoring
 from .ordering import _nn_groups, find_ordered_nn, maximin_order
@@ -64,6 +66,13 @@ class ScaledVecchiaGP:
               Sec. 3.4 on an inner train/test split
     lambda_max : ranges above this are treated as infinite (variable selection,
               Sec. 3.2); set to np.inf to disable
+    n_jobs  : threads used by the optional Cython/OpenMP backend for the
+              general (non-half-integer fixed, or estimated) nu covariance
+              path (see `_matern_general.HAVE_CYTHON_BACKEND`); ignored
+              entirely by the default fixed nu in {0.5, 1.5, 2.5} fast path,
+              which is Numba-accelerated instead. -1 (default) uses all
+              available cores; has no effect if that extension wasn't built,
+              in which case this path is always single-threaded.
     """
 
     m_est: int = 30
@@ -79,6 +88,7 @@ class ScaledVecchiaGP:
     tol: float = 1e-4
     random_state: int | None = 0
     verbose: bool = False
+    n_jobs: int = -1
 
     # fitted state -----------------------------------------------------------
     X_: np.ndarray = field(default=None, init=False, repr=False)
@@ -123,6 +133,11 @@ class ScaledVecchiaGP:
     def nugget_(self):
         return math.exp(self.theta_[-1])
 
+    def _resolve_num_threads(self):
+        if self.n_jobs is None or self.n_jobs < 0:
+            return os.cpu_count() or 1
+        return max(1, self.n_jobs)
+
     def _clip_theta(self, theta, d, estimate_nu):
         hi = math.log(self.lambda_max) if np.isfinite(self.lambda_max) else np.inf
         theta[1:1 + d] = np.clip(theta[1:1 + d], math.log(1e-8), hi)
@@ -145,6 +160,7 @@ class ScaledVecchiaGP:
         estimate_nu = self.nu is None
         self._estimate_nu = estimate_nu
         self.d_ = d
+        num_threads = self._resolve_num_threads()
 
         # Standardise the input box to [0,1]^d so that 1/lambda_l is comparable
         # across dimensions, and centre/scale y for numerical conditioning.
@@ -202,6 +218,7 @@ class ScaledVecchiaGP:
                 self.nu, estimate_nu=estimate_nu, need_grad=True,
                 var_penalty=self.var_penalty,
                 log_var_target=math.log(max(ye.var(), 1e-8)),
+                num_threads=num_threads,
             )
             if g is not None and fixed_nug:      # freeze the nugget direction
                 g = g.copy(); g[-1] = 0.0
@@ -264,7 +281,8 @@ class ScaledVecchiaGP:
             if noise_free:
                 mask[:, K - 1] = 0.0          # predict the latent surface
             Sig, _ = _block_cov(Xb, ranges, var, nug, self.nu_,
-                                 derivs=False, nug_mask=mask)
+                                 derivs=False, nug_mask=mask,
+                                 num_threads=self._resolve_num_threads())
             L = _batch_chol(Sig)
             E = np.zeros((a1 - a0, K, 1))
             E[:, K - 1, 0] = 1.0
@@ -338,7 +356,8 @@ class ScaledVecchiaGP:
             # neighbours that are prediction points are also noise-free
             mask[:, :K - 1] = (block[:, :K - 1] < n).astype(float)
             Sig, _ = _block_cov(Xo[block], ranges, var, nug, self.nu_,
-                                 derivs=False, nug_mask=mask)
+                                 derivs=False, nug_mask=mask,
+                                 num_threads=self._resolve_num_threads())
             L = _batch_chol(Sig)
             E = np.zeros((a1 - a0, K, 1))
             E[:, K - 1, 0] = 1.0
@@ -436,6 +455,9 @@ class ScaledVecchiaGP:
     def summary(self):
         self._check_fitted()
         nu_label = "estimated" if self._estimate_nu else "fixed"
+        if self._estimate_nu or self.nu not in (0.5, 1.5, 2.5):
+            backend = "Cython/OpenMP" if HAVE_CYTHON_BACKEND else "pure NumPy/SciPy"
+            nu_label += f", {backend} backend"
         s = [f"ScaledVecchiaGP(nu={'estimate' if self.nu is None else self.nu}, "
              f"m_est={self.m_est}, m_pred={self.m_pred}, trend='{self.trend}')",
              f"  Vecchia loglik (standardised y) : {self.loglik_:.3f}",

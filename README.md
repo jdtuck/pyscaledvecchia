@@ -67,9 +67,41 @@ q_ij        = sqrt( sum_l ((x_il - x_jl) / lambda_l)^2 )
 All parameters (`sigma^2`, `lambda_1..d`, `nu` if estimated, `tau`) are
 optimized on the log scale so positivity is automatic.
 
-Pure NumPy/SciPy/Numba — no compiled extension to build (Numba JIT-compiles
-the hot loops at runtime and caches them to disk). The general/estimated-nu
-path additionally uses `scipy.special.kv` (not Numba-compatible).
+Pure NumPy/SciPy/Numba by default — no compiled extension is required (Numba
+JIT-compiles the hot loops at runtime and caches them to disk). The general/
+estimated-nu path additionally uses `scipy.special.kv`, and gets faster still
+if the **optional** `scaled_vecchia._matern_cy` Cython/OpenMP extension was
+built at install time:
+
+- It fuses the whole per-block computation (distance, Bessel evaluation,
+  analytic r-derivative, finite-difference nu-derivative, nugget) into one
+  native loop calling `scipy.special.cython_special.kv` directly -- the
+  *same* validated Bessel implementation `scipy.special.kv` uses, just
+  reached at the C level with no per-call Python dispatch -- instead of the
+  several separate NumPy array passes the pure-Python path needs. On its
+  own this is a modest ~1.2-1.3x over the (already symmetry-optimized)
+  pure-NumPy general-Matern path.
+- More importantly, that Bessel call is `nogil`, so the loop over
+  independent conditioning-set blocks runs under OpenMP across multiple
+  threads (`ScaledVecchiaGP(n_jobs=...)`, default `-1` = all cores) --
+  something the pure-NumPy path cannot do at all. This is where most of the
+  real speedup comes from on a multi-core machine.
+- This extension is entirely optional and additive: `pip install` attempts
+  to build it, but degrades gracefully (falling back to pure NumPy/SciPy,
+  with a build-time warning visible under `pip install -v`) if a C compiler
+  or Cython isn't available, or compilation fails for any other reason --
+  this never blocks installing the rest of the package, including the
+  default (fixed nu in {0.5, 1.5, 2.5}, Numba-accelerated) fast path, which
+  doesn't depend on it at all. Whether it's active is exposed as
+  `scaled_vecchia.HAVE_CYTHON_BACKEND` and reported by `gp.summary()`.
+  Because it delegates the actual Bessel-function math to SciPy's own
+  tested implementation rather than reimplementing it, it carries no more
+  numerical-correctness risk than the pure-Python fallback -- verified
+  numerically identical in `tests/test_matern_cy.py` (which is skipped
+  automatically if the extension wasn't built). OpenMP is enabled on Linux
+  and Windows; on macOS the extension still builds and runs (single Bessel
+  evaluations are still faster), just without multi-threading, since stock
+  Apple Clang doesn't support `-fopenmp` out of the box.
 
 ## Installation
 
@@ -83,7 +115,10 @@ or, to also pull in the test dependencies:
 pip install -e ".[test]"
 ```
 
-Requires Python >= 3.9, NumPy >= 1.22, SciPy >= 1.8, Numba >= 0.58.
+Requires Python >= 3.9, NumPy >= 1.22, SciPy >= 1.8, Numba >= 0.58. A C
+compiler and Cython are used opportunistically at install time to build the
+optional acceleration extension described above; neither is required for
+the package to install and work correctly.
 
 ## Quick start
 
@@ -124,6 +159,7 @@ one-line sensitivity analysis for computer-model emulation.
 | `nugget` | `None` | `None` estimates a relative nugget; a float (e.g. `1e-8`) fixes it — useful for deterministic computer models. |
 | `var_correction` | `True` | Estimate the Sec. 3.4 predictive-variance inflation factor `b` on an inner split. |
 | `lambda_max` | `1e3` | Ranges above this are treated as "infinite" (soft variable selection). |
+| `n_jobs` | `-1` | OpenMP threads for the optional Cython backend (general/estimated `nu` only); `-1` uses all cores. No effect on the default fixed-`nu` fast path, and no effect at all if the extension wasn't built. |
 
 See the docstring on `ScaledVecchiaGP` for the full list.
 
@@ -170,19 +206,27 @@ Practical notes:
   [Numba compatibility table](https://numba.readthedocs.io/en/stable/user/installing.html).
 - `maximin_order` is still the exact `O(n^2 d)` algorithm (just a much
   faster constant factor now); see "Notes / limitations" below.
+- For the `nu=None` (or non-half-integer fixed `nu`) path specifically, see
+  the optional Cython/OpenMP extension described above and in
+  `src/scaled_vecchia/_matern_cy.pyx` -- it's a separate acceleration layer
+  from the Numba kernels (Numba doesn't support `scipy.special.kv`), active
+  automatically if it was built (`scaled_vecchia.HAVE_CYTHON_BACKEND`).
 
 ## Package layout
 
 ```
 src/scaled_vecchia/
-    _covariance.py   # Matern correlation + batched dense linear algebra
-    ordering.py      # maximin ordering, ordered nearest-neighbour search
-    likelihood.py     # Vecchia loglikelihood, gradient, Fisher information
-    optimize.py       # Fisher-scoring optimizer with line search
-    gp.py             # ScaledVecchiaGP estimator (fit / predict / predict_joint)
-tests/                # pytest test suite
+    _covariance.py     # Matern correlation + batched dense linear algebra (Numba)
+    _matern_general.py # General (Bessel-based) Matern for non-half-integer/estimated nu
+    _matern_cy.pyx      # Optional Cython/OpenMP acceleration for _matern_general.py
+    ordering.py         # maximin ordering, ordered nearest-neighbour search
+    likelihood.py       # Vecchia loglikelihood, gradient, Fisher information
+    optimize.py         # Fisher-scoring optimizer with line search
+    gp.py               # ScaledVecchiaGP estimator (fit / predict / predict_joint)
+setup.py               # Builds the optional _matern_cy extension, with graceful fallback
+tests/                  # pytest test suite
 examples/
-    borehole_demo.py  # 8-D borehole-function emulation demo (Sec. 4.3 of the paper)
+    borehole_demo.py    # 8-D borehole-function emulation demo (Sec. 4.3 of the paper)
 ```
 
 ## Running the tests
@@ -195,12 +239,19 @@ pytest
 The test suite checks, among other things:
 
 - the Vecchia log-likelihood reduces exactly to the full-GP log-likelihood
-  when the conditioning-set size `m` equals `n - 1`;
-- the analytic gradient matches finite differences;
+  when the conditioning-set size `m` equals `n - 1` (including with
+  `nu=None`);
+- the analytic gradient matches finite differences (including the
+  finite-differenced `nu` component when estimating it);
 - the Fisher information is symmetric and positive (semi-)definite;
 - the ordered nearest-neighbour search matches brute force;
 - end-to-end `fit`/`predict`/`predict_joint`/`sample_joint` behavior on a
-  synthetic smooth function.
+  synthetic smooth function, with both fixed and estimated `nu`;
+- if the optional Cython extension was built, that it is numerically
+  identical to the pure-Python general-Matern implementation across
+  derivatives/`nu`-estimation/nugget-mask combinations, and invariant to
+  the number of OpenMP threads used (`tests/test_matern_cy.py`; this file
+  is skipped automatically if the extension wasn't built).
 
 ## Demo
 
@@ -221,10 +272,13 @@ and draws joint sample paths along a path through input space.
 - **Covariance.** The fast, Numba-accelerated path covers the isotropic
   Matern family with half-integer smoothness (`nu = 0.5, 1.5, 2.5`, closed
   form, no Bessel calls). Any other fixed `nu`, or `nu=None` to estimate it,
-  is supported via a general Bessel-based Matern (`_matern_general.py`) but
-  is not Numba-accelerated, so is correspondingly slower per block.
-- No compiled/GPU backend — everything is vectorized NumPy/SciPy, batched
-  over conditioning-set blocks.
+  is supported via a general Bessel-based Matern (`_matern_general.py`),
+  optionally accelerated by the Cython/OpenMP extension described above
+  (`scaled_vecchia.HAVE_CYTHON_BACKEND`); without it, this path is
+  single-threaded and correspondingly slower per block.
+- GPU is not supported — everything is vectorized NumPy/SciPy/Numba, plus
+  the optional Cython/OpenMP extension for the general-Matern path, all
+  batched over conditioning-set blocks.
 
 ## Citation
 
