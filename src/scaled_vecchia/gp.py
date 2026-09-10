@@ -258,7 +258,7 @@ class ScaledVecchiaGP:
             self._X_obs_ord_cache = self.X_[self._order_obs_cache]
             self._X_scaled_obs_ord_cache = self._X_scaled_cache[self._order_obs_cache]
             self._resid_obs_ord_cache = self._resid_cache[self._order_obs_cache]
-            
+
     # ---------------- fitting ----------------------------------------------
     def fit(self, X, y):
         X = np.ascontiguousarray(np.atleast_2d(X), dtype=float)
@@ -495,14 +495,12 @@ class ScaledVecchiaGP:
         cache is invalidated at the start of `fit()`.
         """
         self._ensure_obs_order_cache()
-        
+
         n, d = self.X_.shape
         ns = Xs.shape[0]
         ranges = self.ranges_
         var, nug = self.variance_, self.nugget_
 
-        if self._order_obs_cache is None:
-            self._order_obs_cache = maximin_order(self._X_scaled_cache)
         order_obs = self._order_obs_cache
 
         Xall = np.vstack([self.X_, Xs])
@@ -551,7 +549,7 @@ class ScaledVecchiaGP:
     def _joint_factor_one(self, Xs, m):
         """Fast path data for the single-point joint predictive case."""
         self._ensure_obs_order_cache()
-        
+
         n = self.X_.shape[0]
         ranges = self.ranges_
         var, nug = self.variance_, self.nugget_
@@ -746,4 +744,3 @@ class ScaledVecchiaGP:
         for l, rel in enumerate(self.relevance_):
             s.append(f"      x[{l}] : {rel:10.4f}")
         return "\n".join(s)
-        
