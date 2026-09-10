@@ -1,5 +1,10 @@
 build/*
 *.egg-info
+__pycache__/
 tests/__pycache__/
+*.nbc
+*.nbi
+src/scaled_vecchia/_matern_cy.c
+src/scaled_vecchia/_matern_cy*.so
 
 .DS_Store

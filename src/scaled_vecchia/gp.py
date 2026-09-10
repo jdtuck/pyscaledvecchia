@@ -36,7 +36,65 @@ from .likelihood import vecchia_profile_loglik
 from .optimize import _fisher_scoring
 from .ordering import _nn_groups, find_ordered_nn, maximin_order
 
-__all__ = ["ScaledVecchiaGP"]
+__all__ = ["ScaledVecchiaGP", "JointPredictiveCache"]
+
+
+@dataclass
+class JointPredictiveCache:
+    """Cached joint-predictive-distribution factorization at a fixed set of
+    test locations, returned by `ScaledVecchiaGP.prepare_joint`.
+
+    Reuse `.sample()` for cheap *repeated* draws (e.g. one fresh sample per
+    iteration of an MCMC/Bayesian-calibration loop) without redoing the
+    expensive ordering/covariance/factorization setup every time -- see
+    `ScaledVecchiaGP.prepare_joint`'s docstring for details and the
+    reasoning. Becomes stale if the originating `ScaledVecchiaGP` is
+    re-fit; call `prepare_joint` again after a re-fit.
+    """
+
+    _gp: "ScaledVecchiaGP"
+    Lt: object            # lower-triangular sparse factor (scipy.sparse.csr_matrix)
+    inv: np.ndarray        # ordering -> original row permutation
+    mu: np.ndarray          # mean, STANDARDIZED (pre response-rescaling) scale
+    ns: int
+    ymu: float
+    ysd: float
+    b: float
+    _var: np.ndarray = field(default=None, repr=False)   # lazily computed, original scale
+
+    @property
+    def mean(self) -> np.ndarray:
+        """Predictive mean, original response scale. Shape (ns,)."""
+        return self.ymu + self.ysd * self.mu
+
+    @property
+    def var(self) -> np.ndarray:
+        """Exact marginal predictive variance, original response scale.
+        Computed on first access and cached (another sparse triangular
+        solve against the cached factorization, not the full setup)."""
+        if self._var is None:
+            S = spsolve_triangular(self.Lt, np.eye(self.ns), lower=True)
+            v = (S ** 2).sum(1)[self.inv]
+            self._var = (self.ysd ** 2) * self.b * v
+        return self._var
+
+    def sample(self, n_sim: int = 100, random_state=None) -> np.ndarray:
+        """Draw `n_sim` fresh joint sample paths, original response scale,
+        shape `(n_sim, ns)`. Cheap: reuses the cached factorization, only
+        performs a sparse triangular solve against fresh Gaussian noise --
+        no ordering, covariance evaluation, or Cholesky factorization.
+
+        Like `ScaledVecchiaGP.sample_joint`, `random_state=None` (the
+        default) draws the *next* values from a persistent per-model random
+        stream (so repeated calls give fresh draws, not the same one), while
+        an explicit `random_state` gives a fully reproducible draw
+        independent of that stream.
+        """
+        rng = self._gp._get_rng(random_state)
+        eps = rng.standard_normal((self.ns, n_sim))
+        dr = spsolve_triangular(self.Lt, eps, lower=True)[self.inv]
+        samples = (self.mu[:, None] + math.sqrt(self.b) * dr).T
+        return self.ymu + self.ysd * samples
 
 
 @dataclass
@@ -99,6 +157,8 @@ class ScaledVecchiaGP:
     d_: int = field(default=None, init=False, repr=False)
     _estimate_nu: bool = field(default=False, init=False, repr=False)
     _nu_fit: float = field(default=None, init=False, repr=False)
+    _order_obs_cache: np.ndarray = field(default=None, init=False, repr=False)
+    _rng: np.random.Generator = field(default=None, init=False, repr=False)
 
     # ---------------- basis / scaling helpers ------------------------------
     def _design(self, X):
@@ -138,6 +198,21 @@ class ScaledVecchiaGP:
             return os.cpu_count() or 1
         return max(1, self.n_jobs)
 
+    def _get_rng(self, random_state):
+        """RNG for sampling calls. An explicit `random_state` always gets its
+        own fresh, independent generator (fully reproducible in isolation).
+        `random_state=None` instead reuses (and advances) a persistent
+        generator seeded once from `self.random_state` -- so repeated calls
+        without an explicit seed give successive *fresh* draws rather than
+        silently repeating the same one, while the whole sequence is still
+        reproducible from `self.random_state`. Reset at the start of `fit()`.
+        """
+        if random_state is not None:
+            return np.random.default_rng(random_state)
+        if self._rng is None:
+            self._rng = np.random.default_rng(self.random_state)
+        return self._rng
+
     def _clip_theta(self, theta, d, estimate_nu):
         hi = math.log(self.lambda_max) if np.isfinite(self.lambda_max) else np.inf
         theta[1:1 + d] = np.clip(theta[1:1 + d], math.log(1e-8), hi)
@@ -161,6 +236,8 @@ class ScaledVecchiaGP:
         self._estimate_nu = estimate_nu
         self.d_ = d
         num_threads = self._resolve_num_threads()
+        self._order_obs_cache = None   # invalidate: depends on X_/ranges_, both about to change
+        self._rng = None               # reset the persistent sampling stream too
 
         # Standardise the input box to [0,1]^d so that 1/lambda_l is comparable
         # across dimensions, and centre/scale y for numerical conditioning.
@@ -328,15 +405,27 @@ class ScaledVecchiaGP:
         Uses the maximin ordering of the combined scaled inputs with all
         observations ordered first.  Returns (U_op, U_pp, perm) where perm maps
         rows of Xs to their position in the prediction ordering.
+
+        The *training-data* maximin ordering (`order_obs`) depends only on
+        `self.X_` and `self.ranges_`, both fixed once `fit()` has run -- it
+        is completely independent of Xs. It is by far the most expensive
+        single step here (an O(n^2) exact maximin ordering), so it is cached
+        on the instance after the first call and reused by every subsequent
+        `predict`/`predict_joint`/`sample_joint` call, rather than
+        recomputed from scratch every time (the previous behaviour). The
+        cache is invalidated at the start of `fit()`.
         """
         n, d = self.X_.shape
         ns = Xs.shape[0]
         ranges = self.ranges_
         var, nug = self.variance_, self.nugget_
 
+        if self._order_obs_cache is None:
+            self._order_obs_cache = maximin_order(self.X_ / ranges)
+        order_obs = self._order_obs_cache
+
         Xall = np.vstack([self.X_, Xs])
         Xsc = Xall / ranges
-        order_obs = maximin_order(Xsc[:n])
         order_pred = maximin_order(Xsc[n:]) + n
         order = np.concatenate([order_obs, order_pred])       # observations first
         Xo_sc = Xsc[order]
@@ -382,6 +471,55 @@ class ScaledVecchiaGP:
 
         Returns a dict with 'mean', optionally 'var' and 'samples' (n_sim, n*).
         The joint law is N(mean, (U_pp U_pp')^{-1}) in the internal ordering.
+
+        `random_state=None` (the default) draws from a persistent per-model
+        random stream, so repeated calls give *fresh* draws each time rather
+        than silently repeating the same sample; pass an explicit
+        `random_state` for a fully reproducible draw independent of that
+        stream. See `_get_rng`.
+
+        If you need repeated *new* samples at the *same* Xstar (e.g. one
+        fresh draw per iteration of an MCMC/Bayesian-calibration loop), call
+        `prepare_joint(Xstar, m)` once outside the loop instead and reuse
+        its cheap `.sample()` method -- this method redoes the expensive
+        setup (ordering, block-covariance evaluation, sparse factorization)
+        from scratch on every call, which dominates the cost for small
+        `n_sim` (see `prepare_joint`'s docstring for the numbers).
+        """
+        cache = self.prepare_joint(Xstar, m=m, exact_var=exact_var)
+        out = {"mean": cache.mean}
+        if exact_var:
+            out["var"] = cache.var
+        if n_sim > 0:
+            out["samples"] = cache.sample(n_sim=n_sim, random_state=random_state)
+            if return_var and "var" not in out:
+                out["var"] = out["samples"].var(0, ddof=1)
+        return out
+
+    def prepare_joint(self, Xstar, m=None, exact_var=False):
+        """Precompute the joint predictive distribution at fixed `Xstar` once,
+        for cheap *repeated* sampling -- e.g. one fresh draw per iteration of
+        an MCMC or Bayesian-calibration loop that queries the emulator at the
+        same design every time (this is exactly the access pattern
+        `scaledVecchia4mvBayes.py` uses).
+
+        The expensive part of joint prediction -- the maximin ordering of
+        the combined train+test inputs, the block-covariance evaluation and
+        Cholesky factorization for every conditioning set, and assembling
+        the sparse inverse-Cholesky factor -- depends only on `Xstar` (and
+        the fitted model), never on the random draws themselves. This method
+        does that work once and returns a `JointPredictiveCache` whose
+        `.sample(n_sim, random_state)` reuses the cached factorization,
+        needing only a sparse triangular solve against fresh Gaussian noise
+        -- typically more than an order of magnitude cheaper than repeating
+        the full setup, and the gap widens as `n_sim` per call shrinks (e.g.
+        drawing exactly one new sample per MCMC iteration, as opposed to
+        drawing many at once).
+
+        `predict_joint`/`sample_joint` call this internally, so ordinary
+        single-call usage is unaffected; this method (and the cache object
+        it returns) is for callers who want to hold the setup across many
+        calls themselves.
         """
         self._check_fitted()
         Xstar = np.ascontiguousarray(np.atleast_2d(Xstar), dtype=float)
@@ -403,25 +541,24 @@ class ScaledVecchiaGP:
         Zs = self._design(Xs)
         if self.beta_.size:
             mu = mu + Zs @ self.beta_
-        out = {"mean": self._ymu + self._ysd * mu}
 
-        rng = np.random.default_rng(self.random_state if random_state is None
-                                     else random_state)
+        var = None
         if exact_var:
             S = spsolve_triangular(Lt, np.eye(ns), lower=True)   # U_pp^{-T}
             v = (S ** 2).sum(1)[inv]
-            out["var"] = (self._ysd ** 2) * self.b_ * v
-        if n_sim > 0:
-            eps = rng.standard_normal((ns, n_sim))
-            dr = spsolve_triangular(Lt, eps, lower=True)[inv]
-            samples = (mu[:, None] + math.sqrt(self.b_) * dr).T
-            out["samples"] = self._ymu + self._ysd * samples
-            if return_var and "var" not in out:
-                out["var"] = out["samples"].var(0, ddof=1)
-        return out
+            var = (self._ysd ** 2) * self.b_ * v
+
+        return JointPredictiveCache(_gp=self, Lt=Lt, inv=inv, mu=mu, ns=ns,
+                                     ymu=self._ymu, ysd=self._ysd, b=self.b_,
+                                     _var=var)
 
     def sample_joint(self, Xstar, n_sim=100, m=None, random_state=None):
-        """Draw joint sample paths from the predictive distribution."""
+        """Draw joint sample paths from the predictive distribution.
+
+        For repeated calls at the same Xstar (e.g. inside an MCMC loop),
+        prefer `prepare_joint(Xstar).sample(...)` -- see that method's
+        docstring for why.
+        """
         return self.predict_joint(
             Xstar,
             m=m,
