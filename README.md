@@ -173,6 +173,12 @@ See the docstring on `ScaledVecchiaGP` for the full list.
   `var` and `samples`.
 - `ScaledVecchiaGP.sample_joint(X, n_sim=100, m=None)` — convenience wrapper
   returning just the sample paths, shape `(n_sim, len(X))`.
+- `ScaledVecchiaGP.prepare_joint(X, m=None)` — precomputes the joint
+  predictive distribution once and returns a `JointPredictiveCache` with a
+  cheap `.sample(n_sim, random_state)`, `.mean`, and `.var`. Use this
+  instead of repeated `predict_joint`/`sample_joint` calls at a **fixed**
+  `X` (e.g. one fresh draw per MCMC/Bayesian-calibration iteration) — see
+  "Repeated prediction" below for why, and by how much.
 - `ScaledVecchiaGP.summary()` — human-readable fit summary.
 - Fitted attributes: `variance_`, `ranges_`, `relevance_`, `nu_`, `nugget_`,
   `beta_`, `loglik_`, `b_`.
@@ -180,6 +186,44 @@ See the docstring on `ScaledVecchiaGP` for the full list.
 Lower-level building blocks are also exported for anyone who wants to
 compose their own estimator: `maximin_order`, `find_ordered_nn`,
 `vecchia_profile_loglik`.
+
+### Repeated prediction (MCMC / Bayesian-calibration loops)
+
+`predict_joint`/`sample_joint` recompute the whole joint predictive
+distribution from scratch on every call — the maximin ordering, every
+conditioning set's covariance evaluation and Cholesky factorization, and
+the sparse inverse-Cholesky assembly — even though almost none of that
+depends on the random draw itself. If you're calling one of them repeatedly
+at the **same** test locations (the common pattern when a GP emulator is
+queried inside a larger MCMC chain, e.g. via `scaledVecchia4mvBayes`), two
+things matter:
+
+1. **Use `prepare_joint` once, then `.sample()` many times.** This skips
+   essentially all of the per-call setup on every call after the first —
+   measured **~20x faster** for repeated single-sample draws (2000 training
+   points, 50 test points, one fresh sample per call: 4.9 ms/call with plain
+   `sample_joint` down to 0.24 ms/call with `prepare_joint` + `.sample()`).
+   `scaledVecchia4mvBayes`'s wrapper already does this internally, caching
+   the setup per distinct `Xtest` — so existing mvBayes-style code gets this
+   speedup automatically without any changes.
+2. **`random_state=None` (the default) now gives a *fresh* draw every call**,
+   not the same one repeated. Previously, an unseeded call reseeded a fresh
+   generator from the fixed `self.random_state` (default `0`) every time,
+   so every call with default arguments silently returned an *identical*
+   sample — a real correctness issue for exactly this repeated-sampling
+   pattern, not just a performance one. Draws now come from a persistent
+   per-model random stream, seeded once from `random_state` (so the whole
+   sequence across a run is still fully reproducible), and advanced on each
+   unseeded call. Passing an explicit `random_state` to a specific call
+   still gives a fully reproducible, independent draw as before.
+
+Even without switching to `prepare_joint`, plain `predict`/`predict_joint`/
+`sample_joint` calls got faster too: the training-data maximin ordering
+(`order_obs`), which depends only on the fitted model and not on the test
+locations, is now cached after the first joint-prediction call and reused
+by every later one (previously recomputed from scratch every call) — this
+alone was **~3x** in the same benchmark above. It's invalidated
+automatically whenever `fit()` is called again.
 
 ## Performance
 
@@ -251,7 +295,17 @@ The test suite checks, among other things:
   identical to the pure-Python general-Matern implementation across
   derivatives/`nu`-estimation/nugget-mask combinations, and invariant to
   the number of OpenMP threads used (`tests/test_matern_cy.py`; this file
-  is skipped automatically if the extension wasn't built).
+  is skipped automatically if the extension wasn't built);
+- unseeded repeated `sample_joint`/`predict_joint`/`prepare_joint().sample()`
+  calls give fresh draws (not a silently repeated one), an explicit
+  `random_state` is still fully reproducible, and re-fitting resets the
+  random stream reproducibly;
+- the training-data ordering cache used by joint prediction doesn't change
+  results across different test locations and is correctly invalidated by
+  `fit()`;
+- `scaledVecchia4mvBayes`'s wrapper caches correctly across repeated calls
+  at the same `Xtest`, invalidates when `Xtest` changes, and reproduces the
+  same draw sequence given the same `random_state` (`tests/test_mvbayes.py`).
 
 ## Demo
 
@@ -262,6 +316,41 @@ python examples/borehole_demo.py
 Fits an emulator to the 8-dimensional borehole function (only ~3 inputs
 matter), reports RMSE and 95% interval coverage against a held-out test set,
 and draws joint sample paths along a path through input space.
+
+## Scaling benchmark
+
+```bash
+pip install -e ".[demo]"   # matplotlib, for optional --plot output
+python benchmarks/scaling_benchmark.py --sweep all
+python benchmarks/scaling_benchmark.py --sweep fit_n_est --plot --csv results.csv
+python benchmarks/scaling_benchmark.py --quick   # small sizes, fast smoke run
+```
+
+A standalone script (not collected by `pytest`) that empirically measures
+wall-clock scaling for `fit()` and every `predict`-family method against the
+complexities documented above and in "Notes / limitations" below: `fit()`
+time vs `n_est` and vs `m_est`, `fit()`'s plateau once `n` exceeds `n_est`,
+marginal `predict()` time vs training-set size and vs number of query
+points, `prepare_joint()`'s one-time setup cost vs training-set size (the
+exact O(n^2) maximin ordering), and a head-to-head comparison of naive
+repeated `sample_joint()` calls against `prepare_joint()` + repeated
+`.sample()` (the MCMC-loop pattern from "Repeated prediction" above). Each
+"vs size" sweep fits an approximate power-law exponent via log-log
+regression so the empirical complexity is a single comparable number, not
+just a table to eyeball; run with `--csv`/`--plot` to save results for
+comparing across machines or branches. See the script's module docstring
+for the full list of sweeps and some caveats on interpreting the fitted
+exponents at moderate problem sizes (fixed per-call overhead can dilute a
+fitted exponent below its true asymptotic value until the size range is
+wide enough).
+
+A small, fast, **opt-in** pytest module (skipped by default -- see its
+docstring for why) checks a few of the same scaling properties as coarse
+regression guards rather than precise measurements:
+
+```bash
+RUN_SCALING_TESTS=1 pytest tests/test_scaling.py -v
+```
 
 ## Notes / limitations relative to the paper
 

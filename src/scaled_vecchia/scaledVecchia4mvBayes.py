@@ -11,6 +11,21 @@ Behavior
 
 Default synthetic posterior sample count:
     nSamples = 1000
+
+Performance
+-----------
+In an MCMC/Bayesian-calibration loop, `.predict(Xtest, ...)` is typically
+called many times against the *same* `Xtest` (the emulator's design is
+fixed for the whole chain; only which/how many draws are requested varies).
+This wrapper caches the expensive part of joint prediction (ordering,
+covariance evaluation, sparse factorization -- see
+`ScaledVecchiaGP.prepare_joint`) the first time a given `Xtest` is seen and
+reuses it on subsequent calls with the same `Xtest`, needing only a cheap
+sparse triangular solve per call thereafter. It also draws from a
+persistent per-model random stream by default (seeded once from
+`random_state`, if given), so repeated calls give *fresh* draws -- not the
+same one repeated -- while the whole sequence stays reproducible from that
+seed.
 """
 
 import numpy as np
@@ -36,7 +51,10 @@ class MvBayesScaledVecchiaWrapper:
     nSamples : int, default=1000
         Number of joint latent mean-function samples to use as synthetic posterior draws.
     random_state : int or None, default=None
-        Random seed passed to joint predictive sampling unless overridden in model kwargs.
+        Seeds the model's persistent random stream (see `ScaledVecchiaGP._get_rng`):
+        fixes the whole sequence of draws across repeated `.predict()` calls for
+        reproducibility, without forcing every individual call to return the
+        same sample.
     **kwargs
         Additional keyword arguments passed to ScaledVecchiaGP(...) constructor.
     """
@@ -69,6 +87,15 @@ class MvBayesScaledVecchiaWrapper:
         residSD_scalar = np.sqrt(self.model.variance_ * self.model.nugget_) * self.model._ysd
         self.samples.residSD = np.repeat(residSD_scalar, self.nSamples)
 
+        # Cache for the (expensive) joint-prediction setup at a fixed Xtest;
+        # see class/module docstring. Invalidated whenever Xtest changes.
+        self._joint_cache = None
+        self._joint_cache_key = None
+
+    @staticmethod
+    def _xtest_key(Xtest):
+        return (Xtest.shape, hash(Xtest.tobytes()))
+
     def predict(self, Xtest, idxSamples=None):
         """
         Return joint samples of the latent mean function (no nugget noise added).
@@ -94,11 +121,18 @@ class MvBayesScaledVecchiaWrapper:
                 idxSamples = idxSamples.reshape(1)
             n_draws = len(idxSamples)
 
-        samples = self.model.sample_joint(
-            Xtest,
-            n_sim=n_draws,
-            random_state=self.random_state,
-        )
+        Xtest = np.ascontiguousarray(np.atleast_2d(Xtest), dtype=float)
+        key = self._xtest_key(Xtest)
+        if self._joint_cache is None or self._joint_cache_key != key:
+            self._joint_cache = self.model.prepare_joint(Xtest)
+            self._joint_cache_key = key
+
+        # random_state=None here (rather than self.random_state) is
+        # deliberate: it draws the *next* values from the model's
+        # persistent stream (already seeded from self.random_state at
+        # construction) instead of resetting to the same seed every call,
+        # which is what gives every .predict() call a fresh sample.
+        samples = self._joint_cache.sample(n_sim=n_draws, random_state=None)
 
         samples = np.asarray(samples)  # expected shape: (n_samples, n_obs)
 

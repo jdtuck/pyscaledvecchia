@@ -188,3 +188,128 @@ def test_nu_property_matches_fixed_setting_when_not_estimated():
                           random_state=0).fit(X, y)
     assert gp._estimate_nu is False
     assert gp.nu_ == 2.5
+
+
+# ---------------------------------------------------------------------------
+# Joint prediction performance/correctness fixes: order_obs caching,
+# prepare_joint + JointPredictiveCache, and the persistent-RNG-by-default fix
+# ---------------------------------------------------------------------------
+
+def test_repeated_unseeded_sample_joint_gives_fresh_draws():
+    """random_state=None must give a *different* draw each call (previously
+    it silently repeated the same draw every time -- see prepare_joint's
+    and _get_rng's docstrings)."""
+    X, y = _sine_data(200, seed=30)
+    gp = ScaledVecchiaGP(m_est=15, m_pred=30, n_est=200, random_state=0).fit(X, y)
+    Xte = np.random.default_rng(31).random((5, 2))
+
+    draws = [gp.sample_joint(Xte, n_sim=1, m=30) for _ in range(5)]
+    for i in range(1, len(draws)):
+        assert not np.array_equal(draws[0], draws[i])
+
+
+def test_explicit_random_state_is_reproducible_and_independent_of_stream():
+    X, y = _sine_data(150, seed=32)
+    gp = ScaledVecchiaGP(m_est=10, m_pred=20, n_est=150, random_state=0).fit(X, y)
+    Xte = np.random.default_rng(33).random((5, 2))
+
+    a = gp.sample_joint(Xte, n_sim=1, m=20, random_state=7)
+    gp.sample_joint(Xte, n_sim=1, m=20)   # advances the persistent stream
+    b = gp.sample_joint(Xte, n_sim=1, m=20, random_state=7)
+    np.testing.assert_array_equal(a, b)
+
+
+def test_refitting_resets_the_persistent_random_stream_reproducibly():
+    X, y = _sine_data(150, seed=34)
+    Xte = np.random.default_rng(35).random((5, 2))
+
+    gp1 = ScaledVecchiaGP(m_est=10, m_pred=20, n_est=150, random_state=0).fit(X, y)
+    seq1 = [gp1.sample_joint(Xte, n_sim=1, m=20) for _ in range(3)]
+
+    gp2 = ScaledVecchiaGP(m_est=10, m_pred=20, n_est=150, random_state=0).fit(X, y)
+    seq2 = [gp2.sample_joint(Xte, n_sim=1, m=20) for _ in range(3)]
+
+    for a, b in zip(seq1, seq2):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_order_obs_cache_does_not_change_results_across_different_xstar():
+    """Repeated predict_joint calls at *different* Xstar must still be
+    correct after order_obs (the training-data ordering) is cached -- it
+    must not accidentally leak stale state."""
+    X, y = _sine_data(250, seed=36)
+    gp = ScaledVecchiaGP(m_est=15, m_pred=30, n_est=250, random_state=0).fit(X, y)
+    rng = np.random.default_rng(37)
+
+    for _ in range(3):
+        Xte = rng.random((10, 2))
+        out = gp.predict_joint(Xte, m=30, exact_var=True)
+        mu_direct, var_direct = gp.predict(Xte, m=30, return_var=True)
+        # joint marginal mean should closely track the independent marginal
+        np.testing.assert_allclose(out["mean"], mu_direct, atol=0.2)
+        assert np.all(out["var"] >= 0)
+
+
+def test_order_obs_cache_invalidated_by_refit():
+    """Directly checks the caching mechanism (not just predicted values,
+    which can look similar across two fits of the same deterministic
+    function regardless of whether the cache is stale)."""
+    X1, y1 = _sine_data(150, seed=38)
+    gp = ScaledVecchiaGP(m_est=10, m_pred=20, n_est=150, random_state=0).fit(X1, y1)
+    Xte = np.random.default_rng(39).random((5, 2))
+    gp.predict_joint(Xte, m=20)   # populates the cache
+    assert gp._order_obs_cache is not None
+    assert gp._order_obs_cache.shape == (150,)
+
+    X2, y2 = _sine_data(180, seed=40)   # different size -> unambiguous check
+    gp.fit(X2, y2)
+    assert gp._order_obs_cache is None   # invalidated immediately by fit()
+
+    gp.predict_joint(Xte, m=20)          # repopulated fresh, matching new data
+    assert gp._order_obs_cache.shape == (180,)
+
+
+def test_prepare_joint_mean_and_var_match_predict_joint():
+    X, y = _sine_data(200, seed=41)
+    gp = ScaledVecchiaGP(m_est=15, m_pred=30, n_est=200, random_state=0).fit(X, y)
+    Xte = np.random.default_rng(42).random((15, 2))
+
+    out = gp.predict_joint(Xte, m=30, exact_var=True)
+    cache = gp.prepare_joint(Xte, m=30)
+    np.testing.assert_allclose(out["mean"], cache.mean, atol=1e-10)
+    np.testing.assert_allclose(out["var"], cache.var, atol=1e-10)
+
+
+def test_prepare_joint_sample_gives_fresh_draws_matching_distribution():
+    X, y = _sine_data(300, seed=43)
+    gp = ScaledVecchiaGP(m_est=15, m_pred=30, n_est=300, random_state=0).fit(X, y)
+    Xte = np.random.default_rng(44).random((10, 2))
+
+    cache = gp.prepare_joint(Xte, m=30)
+    d1 = cache.sample(n_sim=500)
+    d2 = cache.sample(n_sim=500)
+    assert not np.array_equal(d1, d2)
+    np.testing.assert_allclose(d1.mean(0), cache.mean, atol=0.2)
+    np.testing.assert_allclose(d1.var(0), cache.var, rtol=0.4)
+
+
+def test_prepare_joint_becomes_stale_after_refit_is_a_known_limitation():
+    """A cache from `prepare_joint` reflects the model at the time it was
+    prepared and is not silently updated by a later `fit()` call -- calling
+    `prepare_joint` again after refitting is required to see the new fit.
+    Uses two genuinely different functions (not just different samples of
+    the same function) so the two fits are guaranteed to disagree, rather
+    than relying on estimation noise to differ measurably."""
+    rng = np.random.default_rng(45)
+    X1 = rng.random((150, 2))
+    y1 = np.sin(3 * X1[:, 0])
+    gp = ScaledVecchiaGP(m_est=10, m_pred=20, n_est=150, random_state=0).fit(X1, y1)
+    Xte = np.random.default_rng(46).random((5, 2))
+    stale_cache = gp.prepare_joint(Xte, m=20)
+
+    X2 = rng.random((150, 2))
+    y2 = -5.0 * X2[:, 0] + 3.0   # unrelated linear function, far from sin(3x0)
+    gp.fit(X2, y2)
+    fresh_cache = gp.prepare_joint(Xte, m=20)
+
+    assert not np.allclose(stale_cache.mean, fresh_cache.mean, atol=0.3)

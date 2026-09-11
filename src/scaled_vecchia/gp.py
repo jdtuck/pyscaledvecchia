@@ -36,7 +36,73 @@ from .likelihood import vecchia_profile_loglik
 from .optimize import _fisher_scoring
 from .ordering import _nn_groups, find_ordered_nn, maximin_order
 
-__all__ = ["ScaledVecchiaGP"]
+__all__ = ["ScaledVecchiaGP", "JointPredictiveCache"]
+
+
+@dataclass
+class JointPredictiveCache:
+    """Cached joint-predictive-distribution factorization at a fixed set of
+    test locations, returned by `ScaledVecchiaGP.prepare_joint`.
+
+    Reuse `.sample()` for cheap *repeated* draws (e.g. one fresh sample per
+    iteration of an MCMC/Bayesian-calibration loop) without redoing the
+    expensive ordering/covariance/factorization setup every time -- see
+    `ScaledVecchiaGP.prepare_joint`'s docstring for details and the
+    reasoning. Becomes stale if the originating `ScaledVecchiaGP` is
+    re-fit; call `prepare_joint` again after a re-fit.
+    """
+
+    _gp: "ScaledVecchiaGP"
+    Lt: object            # lower-triangular sparse factor (scipy.sparse.csr_matrix)
+    inv: np.ndarray        # ordering -> original row permutation
+    mu: np.ndarray          # mean, STANDARDIZED (pre response-rescaling) scale
+    ns: int
+    ymu: float
+    ysd: float
+    b: float
+    _var: np.ndarray = field(default=None, repr=False)   # lazily computed, original scale
+    _u_pp: float | None = field(default=None, repr=False)
+
+    @property
+    def mean(self) -> np.ndarray:
+        """Predictive mean, original response scale. Shape (ns,)."""
+        return self.ymu + self.ysd * self.mu
+
+    @property
+    def var(self) -> np.ndarray:
+        """Exact marginal predictive variance, original response scale.
+        Computed on first access and cached (another sparse triangular
+        solve against the cached factorization, not the full setup)."""
+        if self._var is None:
+            if self._u_pp is not None:
+                self._var = np.array([(self.ysd ** 2) * self.b / (self._u_pp ** 2)])
+            else:
+                S = spsolve_triangular(self.Lt, np.eye(self.ns), lower=True)
+                v = (S ** 2).sum(1)[self.inv]
+                self._var = (self.ysd ** 2) * self.b * v
+        return self._var
+
+    def sample(self, n_sim: int = 100, random_state=None) -> np.ndarray:
+        """Draw `n_sim` fresh joint sample paths, original response scale,
+        shape `(n_sim, ns)`. Cheap: reuses the cached factorization, only
+        performs a sparse triangular solve against fresh Gaussian noise --
+        no ordering, covariance evaluation, or Cholesky factorization.
+
+        Like `ScaledVecchiaGP.sample_joint`, `random_state=None` (the
+        default) draws the *next* values from a persistent per-model random
+        stream (so repeated calls give fresh draws, not the same one), while
+        an explicit `random_state` gives a fully reproducible draw
+        independent of that stream.
+        """
+        rng = self._gp._get_rng(random_state)
+        if self._u_pp is not None:
+            dr = rng.standard_normal(n_sim) / self._u_pp
+            samples = self.mu[0] + math.sqrt(self.b) * dr
+            return (self.ymu + self.ysd * samples).reshape(n_sim, 1)
+        eps = rng.standard_normal((self.ns, n_sim))
+        dr = spsolve_triangular(self.Lt, eps, lower=True)[self.inv]
+        samples = (self.mu[:, None] + math.sqrt(self.b) * dr).T
+        return self.ymu + self.ysd * samples
 
 
 @dataclass
@@ -99,6 +165,15 @@ class ScaledVecchiaGP:
     d_: int = field(default=None, init=False, repr=False)
     _estimate_nu: bool = field(default=False, init=False, repr=False)
     _nu_fit: float = field(default=None, init=False, repr=False)
+    _order_obs_cache: np.ndarray = field(default=None, init=False, repr=False)
+    _rng: np.random.Generator = field(default=None, init=False, repr=False)
+    _Z_tr_cache: np.ndarray = field(default=None, init=False, repr=False)
+    _resid_cache: np.ndarray = field(default=None, init=False, repr=False)
+    _X_scaled_cache: np.ndarray = field(default=None, init=False, repr=False)
+    _X_obs_ord_cache: np.ndarray = field(default=None, init=False, repr=False)
+    _X_scaled_obs_ord_cache: np.ndarray = field(default=None, init=False, repr=False)
+    _resid_obs_ord_cache: np.ndarray = field(default=None, init=False, repr=False)
+    _pred_tree_cache: cKDTree = field(default=None, init=False, repr=False)
 
     # ---------------- basis / scaling helpers ------------------------------
     def _design(self, X):
@@ -138,6 +213,21 @@ class ScaledVecchiaGP:
             return os.cpu_count() or 1
         return max(1, self.n_jobs)
 
+    def _get_rng(self, random_state):
+        """RNG for sampling calls. An explicit `random_state` always gets its
+        own fresh, independent generator (fully reproducible in isolation).
+        `random_state=None` instead reuses (and advances) a persistent
+        generator seeded once from `self.random_state` -- so repeated calls
+        without an explicit seed give successive *fresh* draws rather than
+        silently repeating the same one, while the whole sequence is still
+        reproducible from `self.random_state`. Reset at the start of `fit()`.
+        """
+        if random_state is not None:
+            return np.random.default_rng(random_state)
+        if self._rng is None:
+            self._rng = np.random.default_rng(self.random_state)
+        return self._rng
+
     def _clip_theta(self, theta, d, estimate_nu):
         hi = math.log(self.lambda_max) if np.isfinite(self.lambda_max) else np.inf
         theta[1:1 + d] = np.clip(theta[1:1 + d], math.log(1e-8), hi)
@@ -148,6 +238,26 @@ class ScaledVecchiaGP:
             theta[1 + d] = np.clip(theta[1 + d], math.log(0.3), math.log(10.0))
         theta[-1] = np.clip(theta[-1], math.log(1e-12), math.log(1e3))
         return theta
+
+    def _refresh_prediction_cache(self):
+        self._Z_tr_cache = self._design(self.X_)
+        self._resid_cache = self.y_ - (
+            self._Z_tr_cache @ self.beta_ if self.beta_.size else 0.0
+        )
+        self._X_scaled_cache = self.X_ / self.ranges_
+        self._pred_tree_cache = cKDTree(self._X_scaled_cache)
+
+        self._X_obs_ord_cache = None
+        self._X_scaled_obs_ord_cache = None
+        self._resid_obs_ord_cache = None
+
+    def _ensure_obs_order_cache(self):
+        if self._order_obs_cache is None:
+            self._order_obs_cache = maximin_order(self._X_scaled_cache)
+        if self._X_obs_ord_cache is None:
+            self._X_obs_ord_cache = self.X_[self._order_obs_cache]
+            self._X_scaled_obs_ord_cache = self._X_scaled_cache[self._order_obs_cache]
+            self._resid_obs_ord_cache = self._resid_cache[self._order_obs_cache]
 
     # ---------------- fitting ----------------------------------------------
     def fit(self, X, y):
@@ -161,6 +271,15 @@ class ScaledVecchiaGP:
         self._estimate_nu = estimate_nu
         self.d_ = d
         num_threads = self._resolve_num_threads()
+        self._order_obs_cache = None   # invalidate: depends on X_/ranges_, both about to change
+        self._rng = None               # reset the persistent sampling stream too
+        self._Z_tr_cache = None
+        self._resid_cache = None
+        self._X_scaled_cache = None
+        self._X_obs_ord_cache = None
+        self._X_scaled_obs_ord_cache = None
+        self._resid_obs_ord_cache = None
+        self._pred_tree_cache = None
 
         # Standardise the input box to [0,1]^d so that 1/lambda_l is comparable
         # across dimensions, and centre/scale y for numerical conditioning.
@@ -248,6 +367,7 @@ class ScaledVecchiaGP:
         self.beta_ = beta
         self.loglik_ = ll
         self._nu_fit = math.exp(theta[1 + d]) if estimate_nu else self.nu
+        self._refresh_prediction_cache()
 
         # ---- variance correction (Sec. 3.4) --------------------------------
         self.b_ = 1.0
@@ -294,6 +414,44 @@ class ScaledVecchiaGP:
             varn[sl] = dv
         return mean, varn
 
+    def _predict_scaled_cached(self, Xs_std, m, noise_free=True):
+        """Cached-training variant of `_predict_scaled` for repeated predict()."""
+        ranges = self.ranges_
+        var = self.variance_
+        nug = self.nugget_
+        m = min(m, self.X_.shape[0])
+
+        _, nb = self._pred_tree_cache.query(Xs_std / ranges, k=m)
+        nb = np.asarray(nb)
+        if m == 1:
+            nb = nb.reshape(-1, 1)
+        else:
+            nb = np.atleast_2d(nb)
+
+        K = m + 1
+        mean = np.empty(Xs_std.shape[0])
+        varn = np.empty(Xs_std.shape[0])
+        for a0, a1 in _chunks(Xs_std.shape[0], K, 1):
+            sl = slice(a0, a1)
+            Xb = np.concatenate([self.X_[nb[sl]], Xs_std[sl][:, None, :]], axis=1)
+            mask = np.ones((a1 - a0, K), dtype=float)
+            if noise_free:
+                mask[:, K - 1] = 0.0
+            Sig, _ = _block_cov(
+                Xb, ranges, var, nug, self.nu_,
+                derivs=False, nug_mask=mask,
+                num_threads=self._resolve_num_threads(),
+            )
+            L = _batch_chol(Sig)
+            E = np.zeros((a1 - a0, K, 1))
+            E[:, K - 1, 0] = 1.0
+            av = _backsolve_LT(L, E)[:, :, 0]
+            dv = 1.0 / av[:, K - 1] ** 2
+            mean[sl] = -np.einsum("bk,bk->b", av[:, :m], self._resid_cache[nb[sl]]) \
+                       / av[:, K - 1]
+            varn[sl] = dv
+        return mean, varn
+
     def predict(self, Xstar, return_std=False, return_var=False, m=None):
         """Marginal predictive mean (and sd/variance) at new inputs.
 
@@ -306,9 +464,7 @@ class ScaledVecchiaGP:
         Xs = (Xstar - self._lo) / self._span
         m = self.m_pred if m is None else m
 
-        Z_tr = self._design(self.X_)
-        resid = self.y_ - (Z_tr @ self.beta_ if self.beta_.size else 0.0)
-        mu, va = self._predict_scaled(Xs, self.X_, resid, m)
+        mu, va = self._predict_scaled_cached(Xs, m)
         Zs = self._design(Xs)
         if self.beta_.size:
             mu = mu + Zs @ self.beta_
@@ -328,15 +484,27 @@ class ScaledVecchiaGP:
         Uses the maximin ordering of the combined scaled inputs with all
         observations ordered first.  Returns (U_op, U_pp, perm) where perm maps
         rows of Xs to their position in the prediction ordering.
+
+        The *training-data* maximin ordering (`order_obs`) depends only on
+        `self.X_` and `self.ranges_`, both fixed once `fit()` has run -- it
+        is completely independent of Xs. It is by far the most expensive
+        single step here (an O(n^2) exact maximin ordering), so it is cached
+        on the instance after the first call and reused by every subsequent
+        `predict`/`predict_joint`/`sample_joint` call, rather than
+        recomputed from scratch every time (the previous behaviour). The
+        cache is invalidated at the start of `fit()`.
         """
+        self._ensure_obs_order_cache()
+
         n, d = self.X_.shape
         ns = Xs.shape[0]
         ranges = self.ranges_
         var, nug = self.variance_, self.nugget_
 
+        order_obs = self._order_obs_cache
+
         Xall = np.vstack([self.X_, Xs])
-        Xsc = Xall / ranges
-        order_obs = maximin_order(Xsc[:n])
+        Xsc = np.vstack([self._X_scaled_cache, Xs / ranges])
         order_pred = maximin_order(Xsc[n:]) + n
         order = np.concatenate([order_obs, order_pred])       # observations first
         Xo_sc = Xsc[order]
@@ -344,9 +512,12 @@ class ScaledVecchiaGP:
         nn = find_ordered_nn(Xo_sc, min(m, n), start=n)       # only pred rows needed
         Xo = Xall[order]
 
-        rows_i, cols_j, vals = [], [], []
         K = min(m, n) + 1
+        rows_i = np.empty(ns * K, dtype=np.int64)
+        cols_j = np.empty(ns * K, dtype=np.int64)
+        vals = np.empty(ns * K, dtype=float)
         pred_rows = np.arange(n, n + ns)
+        ptr = 0
         for a0, a1 in _chunks(ns, K, 1):
             sl = slice(a0, a1)
             r = pred_rows[sl]
@@ -362,13 +533,12 @@ class ScaledVecchiaGP:
             E = np.zeros((a1 - a0, K, 1))
             E[:, K - 1, 0] = 1.0
             av = _backsolve_LT(L, E)[:, :, 0]                 # = column of U
-            rows_i.append(block.ravel())
-            cols_j.append(np.repeat(np.arange(a0, a1), K))
-            vals.append(av.ravel())
+            nnz = (a1 - a0) * K
+            rows_i[ptr:ptr + nnz] = block.ravel()
+            cols_j[ptr:ptr + nnz] = np.repeat(np.arange(a0, a1), K)
+            vals[ptr:ptr + nnz] = av.ravel()
+            ptr += nnz
 
-        rows_i = np.concatenate(rows_i)
-        cols_j = np.concatenate(cols_j)
-        vals = np.concatenate(vals)
         Ufull = sparse.coo_matrix((vals, (rows_i, cols_j)),
                                    shape=(n + ns, ns)).tocsc()
         U_op = Ufull[:n, :]
@@ -376,12 +546,97 @@ class ScaledVecchiaGP:
         # rows of U_op are indexed by position in the *observation ordering*
         return U_op, U_pp, order[n:] - n, order_obs
 
+    def _joint_factor_one(self, Xs, m):
+        """Fast path data for the single-point joint predictive case."""
+        self._ensure_obs_order_cache()
+
+        n = self.X_.shape[0]
+        ranges = self.ranges_
+        var, nug = self.variance_, self.nugget_
+        K = min(m, n) + 1
+
+        xs = np.asarray(Xs, dtype=float).reshape(1, -1)
+        xs_sc = xs / ranges
+        Xo_sc = np.vstack([self._X_scaled_obs_ord_cache, xs_sc])
+        Xo = np.vstack([self._X_obs_ord_cache, xs])
+
+        nn = find_ordered_nn(Xo_sc, min(m, n), start=n)
+        r = n
+        nbrs = nn[r:r + 1, 1:K]
+        block = np.concatenate([nbrs, np.array([[r]], dtype=nn.dtype)], axis=1)
+
+        mask = np.ones((1, K), dtype=float)
+        mask[:, K - 1] = 0.0
+        mask[:, :K - 1] = (block[:, :K - 1] < n).astype(float)
+        Sig, _ = _block_cov(
+            Xo[block], ranges, var, nug, self.nu_,
+            derivs=False, nug_mask=mask,
+            num_threads=self._resolve_num_threads(),
+        )
+        L = _batch_chol(Sig)
+        E = np.zeros((1, K, 1))
+        E[:, K - 1, 0] = 1.0
+        av = _backsolve_LT(L, E)[0, :, 0]
+
+        u_obs = np.zeros(n, dtype=float)
+        u_obs[block[0, :-1]] = av[:-1]
+        return u_obs, float(av[-1])
+
     def predict_joint(self, Xstar, m=None, n_sim=0, exact_var=False, return_var=True,
                        random_state=None):
         """Joint Vecchia predictive distribution (Sec. 3.3).
 
         Returns a dict with 'mean', optionally 'var' and 'samples' (n_sim, n*).
         The joint law is N(mean, (U_pp U_pp')^{-1}) in the internal ordering.
+
+        `random_state=None` (the default) draws from a persistent per-model
+        random stream, so repeated calls give *fresh* draws each time rather
+        than silently repeating the same sample; pass an explicit
+        `random_state` for a fully reproducible draw independent of that
+        stream. See `_get_rng`.
+
+        If you need repeated *new* samples at the *same* Xstar (e.g. one
+        fresh draw per iteration of an MCMC/Bayesian-calibration loop), call
+        `prepare_joint(Xstar, m)` once outside the loop instead and reuse
+        its cheap `.sample()` method -- this method redoes the expensive
+        setup (ordering, block-covariance evaluation, sparse factorization)
+        from scratch on every call, which dominates the cost for small
+        `n_sim` (see `prepare_joint`'s docstring for the numbers).
+        """
+        cache = self.prepare_joint(Xstar, m=m, exact_var=exact_var)
+        out = {"mean": cache.mean}
+        if exact_var:
+            out["var"] = cache.var
+        if n_sim > 0:
+            out["samples"] = cache.sample(n_sim=n_sim, random_state=random_state)
+            if return_var and "var" not in out:
+                out["var"] = out["samples"].var(0, ddof=1)
+        return out
+
+    def prepare_joint(self, Xstar, m=None, exact_var=False):
+        """Precompute the joint predictive distribution at fixed `Xstar` once,
+        for cheap *repeated* sampling -- e.g. one fresh draw per iteration of
+        an MCMC or Bayesian-calibration loop that queries the emulator at the
+        same design every time (this is exactly the access pattern
+        `scaledVecchia4mvBayes.py` uses).
+
+        The expensive part of joint prediction -- the maximin ordering of
+        the combined train+test inputs, the block-covariance evaluation and
+        Cholesky factorization for every conditioning set, and assembling
+        the sparse inverse-Cholesky factor -- depends only on `Xstar` (and
+        the fitted model), never on the random draws themselves. This method
+        does that work once and returns a `JointPredictiveCache` whose
+        `.sample(n_sim, random_state)` reuses the cached factorization,
+        needing only a sparse triangular solve against fresh Gaussian noise
+        -- typically more than an order of magnitude cheaper than repeating
+        the full setup, and the gap widens as `n_sim` per call shrinks (e.g.
+        drawing exactly one new sample per MCMC iteration, as opposed to
+        drawing many at once).
+
+        `predict_joint`/`sample_joint` call this internally, so ordinary
+        single-call usage is unaffected; this method (and the cache object
+        it returns) is for callers who want to hold the setup across many
+        calls themselves.
         """
         self._check_fitted()
         Xstar = np.ascontiguousarray(np.atleast_2d(Xstar), dtype=float)
@@ -389,39 +644,59 @@ class ScaledVecchiaGP:
         m = self.m_pred if m is None else m
         ns = Xs.shape[0]
 
+        if ns == 1:
+            u_obs, u_pp = self._joint_factor_one(Xs[0], m)
+            mu = float(-(u_obs @ self._resid_obs_ord_cache) / u_pp)
+            Zs = self._design(Xs)
+            if self.beta_.size:
+                mu += float((Zs @ self.beta_)[0])
+
+            var = None
+            if exact_var:
+                var = np.array([(self._ysd ** 2) * self.b_ / (u_pp ** 2)])
+
+            return JointPredictiveCache(
+                _gp=self,
+                Lt=None,
+                inv=np.array([0], dtype=np.int64),
+                mu=np.array([mu]),
+                ns=1,
+                ymu=self._ymu,
+                ysd=self._ysd,
+                b=self.b_,
+                _var=var,
+                _u_pp=u_pp,
+            )
+
         U_op, U_pp, perm, order_obs = self._joint_factor(Xs, m)
         inv = np.empty(ns, dtype=np.int64)
         inv[perm] = np.arange(ns)                    # ordering -> original rows
 
-        Z_tr = self._design(self.X_)
-        resid = self.y_ - (Z_tr @ self.beta_ if self.beta_.size else 0.0)
-
         Lt = U_pp.T.tocsr()                          # lower triangular
-        rhs = -(U_op.T @ resid[order_obs])
+        rhs = -(U_op.T @ self._resid_obs_ord_cache)
         mu_ord = spsolve_triangular(Lt, rhs, lower=True)
         mu = mu_ord[inv]
         Zs = self._design(Xs)
         if self.beta_.size:
             mu = mu + Zs @ self.beta_
-        out = {"mean": self._ymu + self._ysd * mu}
 
-        rng = np.random.default_rng(self.random_state if random_state is None
-                                     else random_state)
+        var = None
         if exact_var:
             S = spsolve_triangular(Lt, np.eye(ns), lower=True)   # U_pp^{-T}
             v = (S ** 2).sum(1)[inv]
-            out["var"] = (self._ysd ** 2) * self.b_ * v
-        if n_sim > 0:
-            eps = rng.standard_normal((ns, n_sim))
-            dr = spsolve_triangular(Lt, eps, lower=True)[inv]
-            samples = (mu[:, None] + math.sqrt(self.b_) * dr).T
-            out["samples"] = self._ymu + self._ysd * samples
-            if return_var and "var" not in out:
-                out["var"] = out["samples"].var(0, ddof=1)
-        return out
+            var = (self._ysd ** 2) * self.b_ * v
+
+        return JointPredictiveCache(_gp=self, Lt=Lt, inv=inv, mu=mu, ns=ns,
+                                     ymu=self._ymu, ysd=self._ysd, b=self.b_,
+                                     _var=var)
 
     def sample_joint(self, Xstar, n_sim=100, m=None, random_state=None):
-        """Draw joint sample paths from the predictive distribution."""
+        """Draw joint sample paths from the predictive distribution.
+
+        For repeated calls at the same Xstar (e.g. inside an MCMC loop),
+        prefer `prepare_joint(Xstar).sample(...)` -- see that method's
+        docstring for why.
+        """
         return self.predict_joint(
             Xstar,
             m=m,
