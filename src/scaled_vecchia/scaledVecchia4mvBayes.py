@@ -26,7 +26,15 @@ persistent per-model random stream by default (seeded once from
 `random_state`, if given), so repeated calls give *fresh* draws -- not the
 same one repeated -- while the whole sequence stays reproducible from that
 seed.
+
+mvBayes fits one model per basis component, with the same kwargs, and adds
+their draws, so the components must not share a stream: their draws would be
+perfectly correlated. Each model's stream therefore mixes `random_state` with
+a hash of its own `y`. Models fitted to the same `y` with the same
+`random_state` get the same stream.
 """
+
+import hashlib
 
 import numpy as np
 
@@ -51,10 +59,11 @@ class MvBayesScaledVecchiaWrapper:
     nSamples : int, default=1000
         Number of joint latent mean-function samples to use as synthetic posterior draws.
     random_state : int or None, default=None
-        Seeds the model's persistent random stream (see `ScaledVecchiaGP._get_rng`):
-        fixes the whole sequence of draws across repeated `.predict()` calls for
-        reproducibility, without forcing every individual call to return the
-        same sample.
+        Seeds the model's persistent random stream, together with a hash of `y`
+        (see the module docstring): fixes the whole sequence of draws across
+        repeated `.predict()` calls for reproducibility, without forcing every
+        individual call to return the same sample. None uses the hash alone,
+        which is still reproducible.
     **kwargs
         Additional keyword arguments passed to ScaledVecchiaGP(...) constructor.
     """
@@ -78,6 +87,15 @@ class MvBayesScaledVecchiaWrapper:
 
         self.model = ScaledVecchiaGP(**gp_kwargs)
         self.model.fit(X, y)
+
+        # Set after fit(), which resets the stream. The estimation subsample
+        # in fit() still comes from the GP's own random_state.
+        y_hash = int.from_bytes(
+            hashlib.blake2b(np.asarray(y, dtype=float).tobytes(), digest_size=8).digest(),
+            "little",
+        )
+        entropy = [y_hash] if random_state is None else [random_state, y_hash]
+        self.model._rng = np.random.default_rng(entropy)
 
         self.samples = _MvBayesScaledVecchiaSamples()
 
@@ -129,8 +147,8 @@ class MvBayesScaledVecchiaWrapper:
 
         # random_state=None here (rather than self.random_state) is
         # deliberate: it draws the *next* values from the model's
-        # persistent stream (already seeded from self.random_state at
-        # construction) instead of resetting to the same seed every call,
+        # persistent stream (already seeded at construction) instead of
+        # resetting to the same seed every call,
         # which is what gives every .predict() call a fresh sample.
         samples = self._joint_cache.sample(n_sim=n_draws, random_state=None)
 

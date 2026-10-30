@@ -45,6 +45,32 @@ def test_reproducible_across_independently_constructed_wrappers():
         np.testing.assert_array_equal(a, b)
 
 
+@pytest.mark.parametrize("kwargs", [{}, {"random_state": 7}])
+def test_models_on_different_responses_draw_independently(kwargs):
+    # mvBayes fits one model per basis component, with the same kwargs, and
+    # adds their draws. Joint prediction reorders points by each model's own
+    # ordering, so compare every pair of points, not only the same point.
+    X, y1 = _sine_data(150, seed=11)
+    y2 = np.cos(4 * X[:, 1]) * X[:, 0]
+    Xte = np.random.default_rng(12).random((5, 2))
+
+    draws = [
+        scaledVecchia4mvBayes(X, y, nSamples=2000, m_est=10, m_pred=20,
+                              n_est=150, **kwargs).predict(Xte)
+        for y in (y1, y2)
+    ]
+    r = np.corrcoef(draws[0].T, draws[1].T)[:5, 5:]
+    assert np.abs(r).max() < 0.15
+
+
+def test_default_stream_is_reproducible():
+    X, y = _sine_data(150, seed=13)
+    Xte = np.random.default_rng(14).random((5, 2))
+    w1 = scaledVecchia4mvBayes(X, y, nSamples=10, m_est=10, m_pred=20, n_est=150)
+    w2 = scaledVecchia4mvBayes(X, y, nSamples=10, m_est=10, m_pred=20, n_est=150)
+    np.testing.assert_array_equal(w1.predict(Xte), w2.predict(Xte))
+
+
 def test_predict_shape_and_finiteness():
     X, y = _sine_data(120, seed=5)
     wrapper = scaledVecchia4mvBayes(X, y, nSamples=50, random_state=0,
